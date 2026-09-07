@@ -1,5 +1,11 @@
 # dsh-agent-sentinel
 
+
+<p align="center">
+  <a href="https://github.com/jonah791/dsh-agent-sentinel"><img src="https://img.shields.io/badge/version-0.1.1-blue" alt="version"></a>
+  <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
+  <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
+</p>
 > 哨兵插件：监听热重载信号 → 预检门控 → 重启 web → 唤醒会话。
 > DeepSeek Harness 自研插件 · v0.1.1（从 dsh-agent-watch 拆分）
 
