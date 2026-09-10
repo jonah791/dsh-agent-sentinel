@@ -78,6 +78,45 @@ export const Config = z.object({
 // 2026-09-02 重构 D2：进程管理归 ctx.webman，环境归 ctx.agentRuntime——sentinel 只做监听+协调
 export const inject = ['preflight', 'agentRuntime', 'webman'] as const
 
+/** 唤醒结果（把决策信息公开返回，供调用方决定告警）。 */
+export interface WakeResult {
+  /** 是否真的把提醒投递出去了 */
+  ok: boolean
+  /** 实际唤醒的会话 id（ok=false 时缺省） */
+  sessionId?: string
+  /** 人类可读的原因 */
+  reason: string
+  /** 诊断：当时列表里的候选会话 */
+  candidates: string[]
+}
+
+/**
+ * 会话唤醒服务（`ctx.sessionWaker`）。
+ *
+ * 2026-09-10 提炼：本能力原先只存在于 sentinel 的哨兵周期内，导致
+ * **guardian 的自动拉起路径没有唤醒**（旧 dsh-agent-watch 有，
+ * 2026-08-27 拆三插件时丢失 → 主人实测「重启后没收到提醒」）。
+ * 现提炼为服务：sentinel（哨兵周期）与 guardian（保活自愈拉起）共用同一实现，
+ * 从结构上消除「两条路径各写一份、改一处漏一处」的漂移。
+ */
+export interface SessionWakerService {
+  /**
+   * 等待 web 就绪后向目标会话投递一条提醒。
+   * 目标选择：`explicitId` 有值 → **只认它**（未出现则轮询等待，绝不 fallback 到别的会话，
+   * 避免误唤醒无关会话）；缺省 → 列表内最近活跃的非空会话。
+   * @param text - 投递正文
+   * @param opts - explicitId 指定目标会话；waitWebReadyMs 覆盖就绪等待预算
+   * @returns 唤醒结果（含候选列表，便于诊断）
+   */
+  wakeLatestSession(text: string, opts?: { explicitId?: string; waitWebReadyMs?: number }): Promise<WakeResult>
+}
+
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    sessionWaker?: SessionWakerService
+  }
+}
+
 /** preflight 服务类型（dsh-agent-preflight 提供，跨插件类型增强）。 */
 export interface PreflightService {
   run(workspace: string, mode?: 'full' | 'quick'): Promise<{ pass: boolean; output: string; checks?: Record<string, { ok: boolean; detail: string }> }>
@@ -284,37 +323,80 @@ export function apply(ctx: Context, config: Config): void {
     return false
   }
 
+  /** 目标会话选择（纯逻辑，便于诊断）：explicitId 优先且**只认它**。 */
+  const pickTarget = (
+    sessions: Array<{ sessionId?: string; blank?: boolean; updatedAt?: number }>,
+    explicitId?: string,
+  ): string | undefined => {
+    if (explicitId !== undefined && explicitId !== '') {
+      // 2026-09-10 修正：explicitId 在列表里没出现时**返回 undefined 继续等**，不 fallback。
+      // 原实现会立刻回退到「最近活跃非空会话」→ 重启后若目标会话尚未恢复，
+      // 提醒会被投递给另一个会话（实测 09-10 21:33 发给了 session-bcc626c1 空会话）。
+      return sessions.some((s) => s.sessionId === explicitId) ? explicitId : undefined
+    }
+    return sessions.filter((s) => !s.blank).sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))[0]?.sessionId
+  }
+
+  /**
+   * 唤醒实现（服务与哨兵周期共用）。
+   * @param text - 投递正文
+   * @param opts - explicitId 目标会话；waitWebReadyMs 就绪等待预算
+   * @returns 唤醒结果（含候选列表）
+   */
+  const wakeLatestSession = async (text: string, opts: { explicitId?: string; waitWebReadyMs?: number } = {}): Promise<WakeResult> => {
+    const explicitId = opts.explicitId
+    if (!(await waitWebReady(opts.waitWebReadyMs ?? config.readyTimeoutMs))) {
+      return { ok: false, reason: 'web 未在时限内就绪', candidates: [] }
+    }
+    const MAX_WAIT_MS = 60_000
+    const startedWait = Date.now()
+    let sessions: Array<{ sessionId?: string; blank?: boolean; updatedAt?: number }> = []
+    let sid: string | undefined
+    for (;;) {
+      sessions = await listSessions()
+      sid = pickTarget(sessions, explicitId)
+      if (sid !== undefined) break
+      if (Date.now() - startedWait >= MAX_WAIT_MS) break
+      await sleep(3000)
+    }
+    const candidates = sessions.map((s) => String(s.sessionId ?? '?'))
+    if (sid === undefined) {
+      return {
+        ok: false,
+        reason: explicitId !== undefined && explicitId !== ''
+          ? '等待 ' + Math.round((Date.now() - startedWait) / 1000) + 's 后仍未见目标会话 ' + explicitId
+            + '（不 fallback——避免误唤醒其他会话）'
+          : '等待 ' + Math.round((Date.now() - startedWait) / 1000) + 's 后列表内仍无非空会话',
+        candidates,
+      }
+    }
+    const sent = await sendPrompt(sid, text)
+    return {
+      ok: sent,
+      sessionId: sid,
+      reason: sent ? '已发送' : '发送失败（重试 5 次后放弃）',
+      candidates,
+    }
+  }
+
+  // 暴露为服务：watch profile 内其他插件（guardian）复用同一实现
+  ctx.provide('sessionWaker', { wakeLatestSession })
+
   const decideAndWake = async (explicitId?: string) => {
-    if (!(await waitWebReady(config.readyTimeoutMs))) {
-      logger.error('web 未在时限内就绪，跳过唤醒')
-      // 2026-08-31 审计 M3：web 重启失败是重大事故——落盘 + 电报告警（此前静默）
-      writeIncident({ message: 'web 重启后未在 ' + String(config.readyTimeoutMs) + 'ms 内就绪，唤醒跳过' })
-      void sendTelegram('⚠ [守护] web 重启后未在时限内就绪——请检查 web 启动日志')
+    const r = await wakeLatestSession('[守护] web 已重启（' + new Date().toLocaleTimeString() + '）。请继续。', { explicitId })
+    // 2026-09-10：补「唤醒决策」诊断日志（原实现只记结果，选错对象时无从追查候选列表）
+    logEvent('唤醒决策: explicit=' + String(explicitId ?? '无') + ' 候选=[' + r.candidates.join(',') + '] → ' + String(r.sessionId ?? '未发送'))
+    if (r.ok) {
+      logEvent('唤醒消息已发送: ' + String(r.sessionId))
       return
     }
-    // 2026-09-04 预防修复：冷启动后会话恢复是异步的——session/list 可能暂时为空/不全，
-    // 直接跳过会让「重启后无人唤醒爱丽丝」→ 心跳静默断（事故：09-03 晚停 8 小时）。
-    // 修复：目标会话找不到时重试等待（最长 ~60s），期间持续轮询 list；超时才跳过并告警。
-    const MAX_WAIT_MS = 60_000
-    const findTarget = async (): Promise<string | undefined> => {
-      const sessions = await listSessions()
-      if (explicitId !== undefined && sessions.some((s) => s.sessionId === explicitId)) return explicitId
-      return sessions.filter((s) => !s.blank).sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))[0]?.sessionId
-    }
-    let sid = await findTarget()
-    const startedWait = Date.now()
-    while (sid === undefined && Date.now() - startedWait < MAX_WAIT_MS) {
-      await sleep(3000)
-      sid = await findTarget()
-    }
-    if (sid) {
-      await sendPrompt(sid, '[守护] web 已重启（' + new Date().toLocaleTimeString() + '）。请继续。')
-      logEvent('唤醒消息已发送: ' + sid)
+    logEvent('唤醒未发送: ' + r.reason)
+    if (r.reason.includes('未在时限内就绪')) {
+      writeIncident({ message: 'web 重启后未在 ' + String(config.readyTimeoutMs) + 'ms 内就绪，唤醒跳过' })
+      void sendTelegram('⚠ [守护] web 重启后未在时限内就绪——请检查 web 启动日志')
     } else {
-      logEvent('未找到唤醒目标会话，跳过（等待 ' + Math.round((Date.now() - startedWait) / 1000) + 's 后仍无会话）')
-      // 2026-09-04：找不到会话 = 心跳可能断——落盘 + 告警（此前仅 logEvent 静默）
-      writeIncident({ message: 'web 重启后 ' + Math.round((Date.now() - startedWait) / 1000) + 's 内未找到可唤醒会话（explicit=' + String(explicitId ?? '无') + '）——爱丽丝心跳可能未恢复' })
-      void sendTelegram('⚠ [守护] web 已重启但未找到唤醒目标会话——请打开 GUI 激活会话，或检查 life-core 心跳')
+      writeIncident({ message: 'web 重启后未能唤醒目标会话（explicit=' + String(explicitId ?? '无') + '）：' + r.reason })
+      void sendTelegram('⚠ [守护] web 已重启但未能唤醒目标会话：' + r.reason + '\n候选=[' + r.candidates.join(',') + ']')
     }
   }
 
