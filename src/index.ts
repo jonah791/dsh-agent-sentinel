@@ -15,6 +15,7 @@
 import { watch as fsWatch, existsSync, readFileSync, unlinkSync, writeFileSync, mkdirSync } from 'node:fs'
 import { join, dirname, basename, resolve } from 'node:path'
 import { spawn, execFile, type ChildProcess } from 'node:child_process'
+import { sendTelegramAlert } from './alert-transport.ts'
 import { createHash, createHmac } from 'node:crypto'
 import net from 'node:net'
 import type { Context } from '@deepseek-ai/cordis'
@@ -236,19 +237,22 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   // 2026-08-31 审计 M3：web 重启失败等重大事故需电报告警（此前 sentinel 无主动告警能力）
+  // 2026-09-11 修复（同批审计发现两处缺陷）：
+  //   ① 传输层用 curl.exe（schannel）经代理 → 本环境 TLS 必失败（实测 exit 35，-k/--http1.1 各变体同样失败），
+  //      而同一代理下 Node fetch 正常 → 改用 alert-transport（node-fetch 主通道 + curl 兜底）。
+  //   ② 原实现 `if (!token || !chat) return` + `child.on('error', () => {})` + 无任何落盘 = **静默失败**
+  //      （违反 5.10 §3 / 5.12 §3）→ 现全程落盘（发送中/送达通道/失败原因）。
   const sendTelegram = async (text: string): Promise<void> => {
-    const token = config.telegramBotToken
-    const chat = config.telegramChatId
-    if (!token || !chat) return
-    const body = JSON.stringify({ chat_id: Number(chat), text, disable_notification: false })
-    try {
-      const child = spawn('curl.exe', [
-        '-s', '--max-time', '15', '-x', config.httpProxy || 'http://127.0.0.1:16888',
-        '-H', 'Content-Type: application/json', '-d', body,
-        'https://api.telegram.org/bot' + token + '/sendMessage',
-      ], { windowsHide: true })
-      child.on('error', () => { /* 忽略 */ })
-    } catch { /* 忽略 */ }
+    const hint = text.slice(0, 60).replace(/\s+/g, ' ')
+    logEvent('telegram 告警发送中: ' + hint)
+    const r = await sendTelegramAlert({
+      token: config.telegramBotToken,
+      chatId: config.telegramChatId,
+      text,
+      proxy: config.httpProxy || 'http://127.0.0.1:16888',
+    })
+    logEvent('telegram 告警' + (r.ok ? '已送达（' + r.channel + '）' : '失败（' + r.channel + '）：' + r.detail)
+      + ' — ' + hint)
   }
 
   // ---------- 重启 web（2026-09-02 重构 D2：进程管理归 ctx.webman） ----------

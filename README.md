@@ -49,6 +49,12 @@ cd self-plugins/dsh-agent-sentinel && pnpm install && pnpm build
 - **唤醒协议**：重启后唤醒目标会话，保证热重载不丢上下文
 - 三插件分工：sentinel 协调重启 / preflight 把关 / guardian 保活
 
+## 告警传输（2026-09-11 修正）
+
+重启失败等重大事故的 Telegram 告警走 `src/alert-transport.ts`（主通道 node 子进程 + `NODE_USE_ENV_PROXY=1` 的 `fetch`，兜底 `curl.exe -x <proxy>`），并**全程落盘**（发送中／送达通道／失败原因）。
+
+本插件此前存在两处缺陷，同批修复：① 传输用 `curl.exe`（Schannel 版）经代理 —— 实测 CONNECT 成功但 TLS 必失败（`exit 35`，`-k`／`--http1.1`／`--tlsv1.2` 各变体同样失败），同代理下 Node `fetch` 正常；② 发送函数 `if (!token || !chat) return` + `child.on('error', () => {})` **无任何日志**——告警发没发出去事后无法回答（违反「静默失败＝死亡温床」纪律），现改为每条结论都落盘。
+
 ## License
 
 MIT
