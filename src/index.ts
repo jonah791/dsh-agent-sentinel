@@ -16,6 +16,7 @@ import { watch as fsWatch, existsSync, readFileSync, unlinkSync, writeFileSync, 
 import { join, dirname, basename, resolve } from 'node:path'
 import { spawn, execFile, type ChildProcess } from 'node:child_process'
 import { sendTelegramAlert } from './alert-transport.ts'
+import { decideWakeTarget, type SessionLite } from './wake-target.ts'
 import { createHash, createHmac } from 'node:crypto'
 import net from 'node:net'
 import type { Context } from '@deepseek-ai/cordis'
@@ -327,19 +328,19 @@ export function apply(ctx: Context, config: Config): void {
     return false
   }
 
-  /** 目标会话选择（纯逻辑，便于诊断）：explicitId 优先且**只认它**。 */
-  const pickTarget = (
-    sessions: Array<{ sessionId?: string; blank?: boolean; updatedAt?: number }>,
-    explicitId?: string,
-  ): string | undefined => {
-    if (explicitId !== undefined && explicitId !== '') {
-      // 2026-09-10 修正：explicitId 在列表里没出现时**返回 undefined 继续等**，不 fallback。
-      // 原实现会立刻回退到「最近活跃非空会话」→ 重启后若目标会话尚未恢复，
-      // 提醒会被投递给另一个会话（实测 09-10 21:33 发给了 session-bcc626c1 空会话）。
-      return sessions.some((s) => s.sessionId === explicitId) ? explicitId : undefined
-    }
-    return sessions.filter((s) => !s.blank).sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))[0]?.sessionId
+  /** 通知类目标选择（预检报告/拦截告知）：与唤醒共用同一套裁决——不再各自手搓排序。 */
+  const pickNotifySid = async (anchorId?: string): Promise<{ sid: string | undefined; why: string }> => {
+    const decision = pickTarget(await listSessions(), anchorId)
+    logEvent('通知目标裁决: ' + decision.why)
+    return { sid: decision.sid, why: decision.why }
   }
+
+  /** 目标会话选择（纯逻辑，便于诊断）：见 wake-target.ts 的裁决规则与理由。 */
+  const pickTarget = (
+    sessions: SessionLite[],
+    explicitId?: string,
+  ): { sid: string | undefined; why: string; ranked: string[] } =>
+    decideWakeTarget(sessions, explicitId, Date.now())
 
   /**
    * 唤醒实现（服务与哨兵周期共用）。
@@ -354,33 +355,36 @@ export function apply(ctx: Context, config: Config): void {
     }
     const MAX_WAIT_MS = 60_000
     const startedWait = Date.now()
-    let sessions: Array<{ sessionId?: string; blank?: boolean; updatedAt?: number }> = []
-    let sid: string | undefined
+    let sessions: SessionLite[] = []
+    let decision: { sid: string | undefined; why: string; ranked: string[] } = { sid: undefined, why: '未裁决', ranked: [] }
     for (;;) {
       sessions = await listSessions()
-      sid = pickTarget(sessions, explicitId)
-      if (sid !== undefined) break
+      decision = pickTarget(sessions, explicitId)
+      if (decision.sid !== undefined) break
       if (Date.now() - startedWait >= MAX_WAIT_MS) break
       await sleep(3000)
     }
     const candidates = sessions.map((s) => String(s.sessionId ?? '?'))
-    if (sid === undefined) {
+    if (decision.sid === undefined) {
+      logEvent('唤醒目标裁决: ' + decision.why)
       return {
         ok: false,
         reason: explicitId !== undefined && explicitId !== ''
-          ? '等待 ' + Math.round((Date.now() - startedWait) / 1000) + 's 后仍未见目标会话 ' + explicitId
-            + '（不 fallback——避免误唤醒其他会话）'
-          : '等待 ' + Math.round((Date.now() - startedWait) / 1000) + 's 后列表内仍无非空会话',
+          ? '等待 ' + Math.round((Date.now() - startedWait) / 1000) + 's 后仍无可用用户会话（锚点 ' + String(explicitId) + ' 不可用，且无可替代——不误投）'
+          : '等待 ' + Math.round((Date.now() - startedWait) / 1000) + 's 后列表内仍无用户会话',
         candidates,
       }
     }
-    const sent = await sendPrompt(sid, text)
-    return {
-      ok: sent,
-      sessionId: sid,
-      reason: sent ? '已发送' : '发送失败（重试 5 次后放弃）',
-      candidates,
+    // 2026-09-12：首选失败**换下一个候选**（最多 3 个）并逐次留痕——原实现一次失败即静默放弃
+    const order = [decision.sid, ...decision.ranked.filter((id) => id !== decision.sid)].slice(0, 3)
+    logEvent('唤醒目标裁决: ' + decision.why + ' → 尝试顺序=[' + order.join(',') + ']')
+    for (const target of order) {
+      if (await sendPrompt(target, text)) {
+        return { ok: true, sessionId: target, reason: '已发送', candidates }
+      }
+      logEvent('唤醒投递失败，换下一个候选: ' + target)
     }
+    return { ok: false, reason: '候选 ' + String(order.length) + ' 个全部发送失败（各重试 5 次后放弃）', candidates }
   }
 
   // 暴露为服务：watch profile 内其他插件（guardian）复用同一实现
@@ -461,9 +465,8 @@ export function apply(ctx: Context, config: Config): void {
       logEvent('预检 ' + (pf.pass ? 'PASS' : 'FAIL') + ' workspace=' + workspace)
       if (!pf.pass) {
         writeIncident({ message: 'preflight failed; web kept running', flag: flagPath, workspace, detail: pf.output.slice(-1500) })
-        // 通知目标会话（不删哨兵，修复后 touch 重试）
-        let notifySid = info.sessionId
-        if (!notifySid) notifySid = (await listSessions()).filter((s) => !s.blank).sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))[0]?.sessionId
+        // 通知目标会话（不删哨兵，修复后 touch 重试）——目标裁决统一走 pickNotifySid（2026-09-12）
+        const { sid: notifySid } = await pickNotifySid(info.sessionId)
         if (notifySid) {
           await sendPrompt(notifySid, '[守护] 哨兵触发失败：预检 FAIL（组合无法加载/存在风险），web 未重启（免疫层拦截）。\n' + pf.output.slice(0, 600) + '\n哨兵已保留，修复后 touch ' + flagPath + ' 重试。')
         }
@@ -482,8 +485,7 @@ export function apply(ctx: Context, config: Config): void {
         const invokedGate = readPreflightInvokedGate(workspace)
         if (!invokedGate.ok) {
           writeIncident({ message: 'daemon_restart 被拦：未调用预检工具', flag: flagPath, workspace, detail: invokedGate.reason ?? '' })
-          let notifySid = info.sessionId
-          if (!notifySid) notifySid = (await listSessions()).filter((s) => !s.blank).sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))[0]?.sessionId
+          const { sid: notifySid } = await pickNotifySid(info.sessionId)
           if (notifySid) {
             await sendPrompt(notifySid, '[守护] daemon_restart 被拦：会话中未调用过预检工具（或记录过期）。\n' + (invokedGate.reason ?? '') + '\n请先调用 preflight_check 预检工具，再 daemon_restart。\n哨兵已保留。')
           }
@@ -502,8 +504,7 @@ export function apply(ctx: Context, config: Config): void {
           logEvent('周期完成，哨兵已清理')
         }
       } else {
-        let notifySid = info.sessionId
-        if (!notifySid) notifySid = (await listSessions()).filter((s) => !s.blank).sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))[0]?.sessionId
+        const { sid: notifySid } = await pickNotifySid(info.sessionId)
         const report = '[守护] 预检通过（' + new Date().toLocaleTimeString() + '）——有配置变更请求重启 web，需爱丽丝确认。\n\n【预检报告】\n' + (pf.output.slice(0, 800) || '(无明细)') + '\n\n确认重启：调用 daemon_restart(reason)（哨兵将覆盖，守护执行重启）。拒绝/暂不：哨兵保留，不动 web。'
         const delivered = notifySid ? await sendPrompt(notifySid, report) : false
         logEvent(delivered ? '预检报告已送达爱丽丝（' + notifySid + '），等待确认（哨兵保留）' : '预检报告发送失败（无目标会话），哨兵保留')
