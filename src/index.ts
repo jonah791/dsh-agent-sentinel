@@ -17,6 +17,7 @@ import { join, dirname, basename, resolve } from 'node:path'
 import { spawn, execFile, type ChildProcess } from 'node:child_process'
 import { sendTelegramAlert } from './alert-transport.ts'
 import { decideWakeTarget, type SessionLite } from './wake-target.ts'
+import { LEASE_TTL_MS, clearLease, writeLease } from './lease.ts'
 import { createHash, createHmac } from 'node:crypto'
 import net from 'node:net'
 import type { Context } from '@deepseek-ai/cordis'
@@ -492,16 +493,30 @@ export function apply(ctx: Context, config: Config): void {
           logEvent('daemon_restart 被拦（未调用预检工具）: ' + (invokedGate.reason ?? ''))
           return // 哨兵保留
         }
-        await restartWeb(workspace)
-        await decideAndWake(info.sessionId)
-        if (pendingFlagPath === flagPath) {
-          // 2026-08-31 审计 M1：周期内哨兵被重新 touch——保留 flag，由 finally 重新调度下一轮（不丢弃新触发）
-          logger.info('周期内哨兵被重新 touch，保留 flag 待下一轮: ' + flagPath)
-          logEvent('周期完成（期间哨兵被重新 touch，flag 保留待下一轮）')
-        } else {
-          try { unlinkSync(flagPath) } catch { /* 已清理 */ }
-          logger.info('哨兵已清理: ' + flagPath)
-          logEvent('周期完成，哨兵已清理')
+        // 【生命周期租约 · 2026-09-12 双重重启事故修复】取租后再动手：web 生命周期的两个
+        // owner（哨兵 kill+spawn+唤醒 / 守护保活拉起+唤醒）必须有互斥交接——守护在窗口内
+        // 查租约，被持有即「收养而非拉起、不重复唤醒」。finally 释放（只释放自己的）；
+        // TTL 兜底：哨兵崩溃也不会把服务永久锁给别人（过期即视为空闲）。
+        writeLease(dshHome, {
+          owner: 'sentinel', atMs: Date.now(), ttlMs: LEASE_TTL_MS,
+          note: 'hot-reload:' + basename(flagPath),
+        })
+        logEvent('生命周期租约：哨兵持有（ttl=' + String(LEASE_TTL_MS) + 'ms）——守护应让位')
+        try {
+          await restartWeb(workspace)
+          await decideAndWake(info.sessionId)
+          if (pendingFlagPath === flagPath) {
+            // 2026-08-31 审计 M1：周期内哨兵被重新 touch——保留 flag，由 finally 重新调度下一轮（不丢弃新触发）
+            logger.info('周期内哨兵被重新 touch，保留 flag 待下一轮: ' + flagPath)
+            logEvent('周期完成（期间哨兵被重新 touch，flag 保留待下一轮）')
+          } else {
+            try { unlinkSync(flagPath) } catch { /* 已清理 */ }
+            logger.info('哨兵已清理: ' + flagPath)
+            logEvent('周期完成，哨兵已清理')
+          }
+        } finally {
+          const rel = clearLease(dshHome, 'sentinel')
+          logEvent('生命周期租约：哨兵释放（' + rel.why + '）')
         }
       } else {
         const { sid: notifySid } = await pickNotifySid(info.sessionId)
