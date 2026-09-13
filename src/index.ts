@@ -12,12 +12,16 @@
  * （渐进拆分：本版暂内嵌 spawn，guardian 拆出后改注入 ctx.guardian）。
  * @module dsh-agent-sentinel
  */
-import { watch as fsWatch, existsSync, readFileSync, unlinkSync, writeFileSync, mkdirSync } from 'node:fs'
+import { watch as fsWatch, existsSync, readFileSync, unlinkSync, writeFileSync, mkdirSync, readdirSync, statSync } from 'node:fs'
 import { join, dirname, basename, resolve } from 'node:path'
 import { spawn, execFile, type ChildProcess } from 'node:child_process'
 import { sendTelegramAlert } from './alert-transport.ts'
 import { decideWakeTarget, type SessionLite } from './wake-target.ts'
 import { LEASE_TTL_MS, clearLease, writeLease } from './lease.ts'
+import {
+  decideSentinelGate, pickLatestBuildMs, resolveWebStartMs,
+  type PreflightRecord, type WebStartRecord,
+} from './preflight-gate.ts'
 import { createHash, createHmac } from 'node:crypto'
 import net from 'node:net'
 import type { Context } from '@deepseek-ai/cordis'
@@ -196,6 +200,8 @@ function buildBrowserAuthCookie(dshHome: string, authority: string): string | un
 export function apply(ctx: Context, config: Config): void {
   const logger = ctx.logger('sentinel')
   const dshHome = config.dshHome || process.env.DSH_HOME || process.cwd()
+  /** 本哨兵进程启动时刻（用于判定 web 启动记录是否属于本进程——§5.16 §2 锚点新鲜度纪律）。 */
+  const sentinelProcStartMs = Date.now()
   // telegram 告警凭据单一来源（2026-09-06）：config 优先 → .credentials.yaml refs.TELEGRAM_BOT_TOKEN 兜底
   if (!config.telegramBotToken || !config.telegramChatId) {
     try {
@@ -284,6 +290,8 @@ export function apply(ctx: Context, config: Config): void {
       return
     }
     await spawnWeb(workspace)
+    // 记录本轮 web 启动时刻（t-49913844 判据对齐）：闸门据此要求「预检记录不早于本轮 web 启动」。
+    writeWebStartRecord(workspace)
   }
 
   // ---------- 唤醒 ----------
@@ -419,21 +427,67 @@ export function apply(ctx: Context, config: Config): void {
     return {}
   }
 
-  /** 预检工具调用记录闸门（主人 2026-08-30）：重启前检查会话中是否调用过预检工具。 */
-  const readPreflightInvokedGate = (workspace: string): { ok: boolean; reason?: string } => {
+  // ---------- 预检闸门（2026-09-13 判据对齐 · t-49913844） ----------
+  // 判据 = **组合变更新鲜度**（fail-closed）：`rec.atMs >= max(最新构建 mtime, 本轮 web 启动时刻)`。
+  // 纯逻辑在 preflight-gate.ts（离线单测：尸体样本＝构建晚于预检必须拒绝）；此处只做 IO 接线。
+  // 文案一律说「本 web 进程」——§5.11 §3 已明确判据是**进程级**，不是会话级（旧文案漂移已修）。
+
+  /** web 启动记录（哨兵 spawn web 时自记；无记录 → 退化为只比构建 mtime，更严不更松）。 */
+  const webStartFile = join(dshHome, '.sentinel-web-start.json')
+  const readWebStartRecord = (): WebStartRecord | null => {
     try {
-      const invokedFile = join(dshHome, '.preflight-invoked.json')
-      if (!existsSync(invokedFile)) return { ok: false, reason: '本会话未调用过预检工具（preflight_check）' }
-      const rec = JSON.parse(readFileSync(invokedFile, 'utf8')) as { atMs?: number; workspace?: string; pass?: boolean }
-      if (rec.pass !== true) return { ok: false, reason: '最近预检未通过' }
-      if (rec.workspace !== workspace) return { ok: false, reason: '预检记录 workspace 不匹配' }
-      if (typeof rec.atMs !== 'number' || Date.now() - rec.atMs > 30 * 60 * 1000) {
-        return { ok: false, reason: '预检记录已过期（>30 分钟，非本会话）' }
+      if (!existsSync(webStartFile)) return null
+      return JSON.parse(readFileSync(webStartFile, 'utf8')) as WebStartRecord
+    } catch { return null }
+  }
+  const writeWebStartRecord = (workspace: string): void => {
+    try {
+      writeFileSync(webStartFile, JSON.stringify({ atMs: Date.now(), workspace, pid: process.pid }, null, 2), 'utf8')
+    } catch (e) { logger.warn('web 启动记录落盘失败: ' + String(e)) }
+  }
+
+  /** 扫 self-plugins 各插件 lib/index.js 的最大 mtime（IO；纯取值在 pickLatestBuildMs）。 */
+  const scanLatestBuildMs = (): number => {
+    const entries: Array<{ path: string; mtimeMs: number }> = []
+    const dirs = [join(dshHome, '..', 'self-plugins'), join(config.defaultWorkspace || process.cwd(), 'self-plugins')]
+    const seen = new Set<string>()
+    for (const dir of dirs) {
+      if (seen.has(dir) || !existsSync(dir)) continue
+      seen.add(dir)
+      let names: string[] = []
+      try { names = readdirSync(dir) } catch { continue }
+      for (const n of names) {
+        if (n.startsWith('.')) continue
+        const lib = join(dir, n, 'lib', 'index.js')
+        try {
+          if (existsSync(lib)) entries.push({ path: lib, mtimeMs: statSync(lib).mtimeMs })
+        } catch { /* 单插件不可读跳过 */ }
       }
-      return { ok: true }
-    } catch (e) {
-      return { ok: false, reason: '读取预检记录失败: ' + String(e) }
     }
+    const latest = pickLatestBuildMs(entries)
+    if (latest === 0) {
+      // §5.10 §3：静默失败是死亡温床——「无构建信息」必须留证，否则判据悄悄失效无人知晓。
+      logEvent('预检闸门警告：未扫到任何插件构建产物（self-plugins 路径或权限异常）——本次组合变更新鲜度判据未生效')
+    }
+    return latest
+  }
+
+  /** 预检工具调用记录闸门（主人 2026-08-30 立；2026-09-13 判据对齐）：重启前校验预检验证过**当前组合**。 */
+  const readPreflightInvokedGate = (workspace: string): { ok: boolean; reason?: string } => {
+    const invokedFile = join(dshHome, '.preflight-invoked.json')
+    let rec: PreflightRecord | null = null
+    let readIssue: string | undefined
+    try {
+      if (existsSync(invokedFile)) rec = JSON.parse(readFileSync(invokedFile, 'utf8')) as PreflightRecord
+    } catch (e) {
+      readIssue = '读取/解析失败: ' + String(e)
+    }
+    const latestBuildMs = scanLatestBuildMs()
+    const ws = resolveWebStartMs(readWebStartRecord(), { sentinelProcStartMs, workspace })
+    const d = decideSentinelGate(rec, { workspace, latestBuildMs, webStartMs: ws.webStartMs, readIssue })
+    logEvent('预检闸门裁决: ' + (d.ok ? '放行' : '拒绝（' + (d.reason ?? '') + '）')
+      + ' · ' + d.evidence + ' · web 启动时刻来源: ' + ws.why)
+    return { ok: d.ok, reason: d.reason }
   }
 
   let busy = false
@@ -481,16 +535,16 @@ export function apply(ctx: Context, config: Config): void {
       //    （wakeup 唤醒），保留哨兵等确认；爱丽丝确认后调 daemon_restart 覆盖哨兵 → 再次触发走上一分支重启
       const isAliceConfirmed = (info.note ?? '').startsWith('daemon_restart:')
       if (isAliceConfirmed) {
-        // 【预检工具调用校验 · 主人 2026-08-30】重启前检查会话中是否调用过预检工具（.preflight-invoked.json）。
-        // plugin-manager 的 daemon_restart 写哨兵前已校验；此处兜底防绕过（直接手写 daemon_restart 哨兵）。
+        // 【预检工具调用校验 · 主人 2026-08-30；2026-09-13 t-49913844 判据对齐】重启前校验
+        // **本 web 进程内**调用过预检工具且预检验证过当前组合（.preflight-invoked.json + 组合新鲜度）。
         const invokedGate = readPreflightInvokedGate(workspace)
         if (!invokedGate.ok) {
-          writeIncident({ message: 'daemon_restart 被拦：未调用预检工具', flag: flagPath, workspace, detail: invokedGate.reason ?? '' })
+          writeIncident({ message: 'daemon_restart 被拦：未通过预检闸门', flag: flagPath, workspace, detail: invokedGate.reason ?? '' })
           const { sid: notifySid } = await pickNotifySid(info.sessionId)
           if (notifySid) {
-            await sendPrompt(notifySid, '[守护] daemon_restart 被拦：会话中未调用过预检工具（或记录过期）。\n' + (invokedGate.reason ?? '') + '\n请先调用 preflight_check 预检工具，再 daemon_restart。\n哨兵已保留。')
+            await sendPrompt(notifySid, '[守护] daemon_restart 被拦：本 web 进程内未通过预检闸门。\n' + (invokedGate.reason ?? '') + '\n请先调用 preflight_check 预检工具（若最新构建晚于上次预检，必须重新预检），再 daemon_restart。\n哨兵已保留。')
           }
-          logEvent('daemon_restart 被拦（未调用预检工具）: ' + (invokedGate.reason ?? ''))
+          logEvent('daemon_restart 被拦（未通过预检闸门）: ' + (invokedGate.reason ?? ''))
           return // 哨兵保留
         }
         // 【生命周期租约 · 2026-09-12 双重重启事故修复】取租后再动手：web 生命周期的两个
