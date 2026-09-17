@@ -34,6 +34,25 @@ export interface WakeTargetDecision {
 /** 显式锚点新鲜度阈值（ms）：滞后超过它即认为锚点腐化。 */
 export const DEFAULT_ANCHOR_STALE_MS = 10 * 60_000
 
+/** 裁决选项。 */
+export interface WakeTargetOptions {
+  /** 锚点新鲜度阈值（仅 `trustAnchor=false` 时生效）。 */
+  anchorStaleMs?: number
+  /**
+   * 锚点是否为「触发者」（默认 false = 旧行为）。
+   *
+   * 主人 2026-09-14 定调：「**那个会话触发的，提醒就发到那个会话**」。
+   * 触发者锚点（写哨兵那一刻的调用者会话）天然新鲜——它**刚刚调用过工具**，
+   * 所以「滞后即腐化」对它不仅多余而且有害：实测 2026-09-14 18:17 的重启中，
+   * 触发者会话只因跑了 36min 长 turn（工具事件不推进 updatedAt）就被判「腐化」，
+   * 提醒被改投到另一个会话，主人永远收不到。
+   *
+   * `trustAnchor=true` 时只按**存在性与会话类型**裁决：锚点仍在列表且是用户会话 → 投它；
+   * 不存在/空白/子代理 → 才回退最近活跃（回退理由照旧写进 why，可诊断）。
+   */
+  trustAnchor?: boolean
+}
+
 /**
  * updatedAt 归一化到 ms：会话列表在不同宿主版本上给秒或毫秒，按量级判别。
  * @param value - 原始 updatedAt
@@ -79,9 +98,10 @@ export function decideWakeTarget(
   sessions: readonly SessionLite[],
   explicitId: string | undefined,
   nowMs: number,
-  opts: { anchorStaleMs?: number } = {},
+  opts: WakeTargetOptions = {},
 ): WakeTargetDecision {
   const staleMs = opts.anchorStaleMs ?? DEFAULT_ANCHOR_STALE_MS
+  const trustAnchor = opts.trustAnchor === true
   const ranked = rankUserSessions(sessions)
   const rankedIds = ranked.map((s) => String(s.sessionId))
   if (ranked.length === 0) {
@@ -108,7 +128,15 @@ export function decideWakeTarget(
       ranked: rankedIds,
     }
   }
-  const lagMs = toMs(newest.updatedAt) - toMs(anchor.updatedAt)
+  const lagMs = Math.max(0, toMs(newest.updatedAt) - toMs(anchor.updatedAt))
+  if (trustAnchor) {
+    // 触发者绑定：滞后不是腐化证据（触发者刚调用过工具；长 turn 期间 updatedAt 不推进）
+    return {
+      sid: String(explicitId),
+      why: '锚点 ' + String(explicitId) + ' 是本次触发者 → 绑定投递（滞后 ' + Math.round(lagMs / 1000) + 's，不作为腐化证据）',
+      ranked: rankedIds,
+    }
+  }
   if (lagMs > staleMs) {
     return {
       sid: newestId,

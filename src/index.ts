@@ -17,6 +17,14 @@ import { join, dirname, basename, resolve } from 'node:path'
 import { spawn, execFile, type ChildProcess } from 'node:child_process'
 import { sendTelegramAlert } from './alert-transport.ts'
 import { decideWakeTarget, type SessionLite } from './wake-target.ts'
+import {
+  describeReject,
+  isRerouted,
+  planWakeAttempts,
+  rerouteNotice,
+  summarizeFailures,
+  type PromptAttempt,
+} from './wake-delivery.ts'
 import { LEASE_TTL_MS, clearLease, writeLease } from './lease.ts'
 import {
   decideSentinelGate, pickLatestBuildMs, resolveWebStartMs,
@@ -60,6 +68,17 @@ export interface Config {
   telegramBotToken: string
   telegramChatId: string
   httpProxy: string
+  /**
+   * 单个候选的「轮内」尝试次数（每次失败间隔 `promptRetryDelayMs`）。
+   * 2026-09-17：原实现把 5 × 3000ms 写死在函数体里——行为保留为缺省，但不再不可调。
+   */
+  promptAttempts: number
+  /** 轮内重试间隔（ms）。 */
+  promptRetryDelayMs: number
+  /** 首选（触发者）候选跑几轮——重启后首选失败常是**瞬时**状态，多等一轮胜过改投。 */
+  primaryWaves: number
+  /** 其余候选跑几轮。 */
+  othersWaves: number
 }
 
 export const Config = z.object({
@@ -79,6 +98,10 @@ export const Config = z.object({
   telegramBotToken: z.string().default(''),
   telegramChatId: z.string().default(''),
   httpProxy: z.string().default('http://127.0.0.1:16888'),
+  promptAttempts: z.number().default(5),
+  promptRetryDelayMs: z.number().default(3000),
+  primaryWaves: z.number().default(2),
+  othersWaves: z.number().default(1),
 })
 
 // 注入 preflight/runtime/webman 服务（dsh-agent-preflight / dsh-agent-runtime 提供）
@@ -109,11 +132,15 @@ export interface WakeResult {
 export interface SessionWakerService {
   /**
    * 等待 web 就绪后向目标会话投递一条提醒。
-   * 目标选择：`explicitId` 有值 → **只认它**（未出现则轮询等待，绝不 fallback 到别的会话，
-   * 避免误唤醒无关会话）；缺省 → 列表内最近活跃的非空会话。
+   * 目标选择：`explicitId` 有值 → **优先它**（作为本次触发者时 `trustAnchor` 生效——「滞后」
+   * 对它不是腐化证据）；它在列表里不可用、或判为腐化时，**按 `ranked` 改投别的用户会话**
+   * （每次裁决写理由行到 `.watch-events.log`，改投另有 `唤醒改投:` 行 + 告警）；
+   * 缺省 → 列表内最近活跃的非空会话。候选依次尝试，**每个候选的失败都带真实原因**。
    * @param text - 投递正文
    * @param opts - explicitId 指定目标会话；waitWebReadyMs 覆盖就绪等待预算
    * @returns 唤醒结果（含候选列表，便于诊断）
+   * @remarks 2026-09-17：原文写「只认它…绝不 fallback 到别的会话」，与 v2 实现（腐化即改投）
+   * 相反——本次随 v0.1.2 一并改正（U7 闭环）。
    */
   wakeLatestSession(text: string, opts?: { explicitId?: string; waitWebReadyMs?: number }): Promise<WakeResult>
 }
@@ -322,19 +349,33 @@ export function apply(ctx: Context, config: Config): void {
     } catch { return [] }
   }
 
-  const sendPrompt = async (sessionId: string, text: string): Promise<boolean> => {
-    for (let attempt = 1; attempt <= 5; attempt += 1) {
+  /**
+   * 向目标会话投递一条提醒（`session/prompt`）。
+   *
+   * 2026-09-17 证据层修复：原实现的 catch 分支吞掉全部失败原因（异常文本从不落盘），
+   * 且 web 返回的 `result.ok !== true` 也被直接丢弃 ⇒ 三次投递全败后日志只剩
+   * 「换下一个候选: <id>」，判不出「会话忙」还是「会话已被清掉」（§5.22 五问③答不了）。
+   * 现在返回 `{ok, reason}`：**失败必带真实文案**（最后一次尝试的原因）。
+   */
+  const sendPrompt = async (sessionId: string, text: string): Promise<PromptAttempt> => {
+    const attempts = Math.max(1, Math.trunc(config.promptAttempts))
+    const gap = Math.max(0, Math.trunc(config.promptRetryDelayMs))
+    let reason = '未执行任何尝试'
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
       try {
         const data = await apiRpc('session/prompt', {
           type: 'client-request', rpcId: 'dsh-sentinel-' + Date.now(),
           method: 'session/prompt',
           payload: { args: { request: { requestId: 'dsh-sentinel-' + Date.now(), sessionId, mode: 'steer', content: [{ type: 'text', text }] } } },
         })
-        if (data?.result?.ok === true) return true
-      } catch { /* 重试 */ }
-      await sleep(3000)
+        if (data?.result?.ok === true) return { ok: true, reason: 'ok' }
+        reason = describeReject(data?.result, data)
+      } catch (err) {
+        reason = 'fetch 异常: ' + (err instanceof Error ? err.name + ': ' + err.message : String(err))
+      }
+      if (attempt < attempts) await sleep(gap)
     }
-    return false
+    return { ok: false, reason }
   }
 
   /** 通知类目标选择（预检报告/拦截告知）：与唤醒共用同一套裁决——不再各自手搓排序。 */
@@ -344,12 +385,17 @@ export function apply(ctx: Context, config: Config): void {
     return { sid: decision.sid, why: decision.why }
   }
 
-  /** 目标会话选择（纯逻辑，便于诊断）：见 wake-target.ts 的裁决规则与理由。 */
+  /**
+   * 目标会话选择（纯逻辑，便于诊断）：见 wake-target.ts 的裁决规则与理由。
+   * `trustAnchor: true` —— 锚点是**本次触发者**（写哨兵那一刻的调用者会话；主人 2026-09-14 定调
+   * 「那个会话触发的，提醒就发到那个会话」）：「滞后」对触发者不是腐化证据（触发者刚调用过工具，
+   * 长 turn 期间 updatedAt 不推进）——旧判据会因此把提醒改投到别的会话，主人永远收不到。
+   */
   const pickTarget = (
     sessions: SessionLite[],
     explicitId?: string,
   ): { sid: string | undefined; why: string; ranked: string[] } =>
-    decideWakeTarget(sessions, explicitId, Date.now())
+    decideWakeTarget(sessions, explicitId, Date.now(), { trustAnchor: true })
 
   /**
    * 唤醒实现（服务与哨兵周期共用）。
@@ -385,15 +431,33 @@ export function apply(ctx: Context, config: Config): void {
       }
     }
     // 2026-09-12：首选失败**换下一个候选**（最多 3 个）并逐次留痕——原实现一次失败即静默放弃
+    // 2026-09-17 健壮性增强（该路径首次线上触发后）：
+    //   ① 首选（触发者）多给一轮——重启后首选失败常是瞬时状态（该会话刚被打断/正在恢复）；
+    //   ② **每次失败都记原因**（旧实现吞异常，只留「换下一个候选: <id>」）；
+    //   ③ 改投留痕 + 告警：让「本该发给触发者的提醒被发给了别人」可见（原实现静默）。
     const order = [decision.sid, ...decision.ranked.filter((id) => id !== decision.sid)].slice(0, 3)
     logEvent('唤醒目标裁决: ' + decision.why + ' → 尝试顺序=[' + order.join(',') + ']')
-    for (const target of order) {
-      if (await sendPrompt(target, text)) {
-        return { ok: true, sessionId: target, reason: '已发送', candidates }
+    const failures: Array<{ target: string; reason: string }> = []
+    for (const plan of planWakeAttempts(order, { primaryWaves: config.primaryWaves, othersWaves: config.othersWaves })) {
+      let lastReason = '未尝试'
+      for (let wave = 1; wave <= plan.waves; wave += 1) {
+        const attempt = await sendPrompt(plan.target, text)
+        if (attempt.ok) {
+          if (isRerouted(decision.sid, plan.target)) {
+            logEvent('唤醒改投: 首选 ' + String(decision.sid) + ' 失败 → 实投 ' + plan.target + '（' + summarizeFailures(failures) + '）')
+            void sendTelegram(rerouteNotice(decision.sid, plan.target, failures))
+          }
+          const rerouteReason = failures.length > 0 ? '改投成功（首选失败：' + summarizeFailures(failures) + '）' : '已发送'
+          return { ok: true, sessionId: plan.target, reason: rerouteReason, candidates }
+        }
+        lastReason = attempt.reason
+        logEvent('唤醒投递失败 ' + plan.target + '（第 ' + String(wave) + '/' + String(plan.waves) + ' 轮）：' + attempt.reason)
+        if (wave < plan.waves) await sleep(config.promptRetryDelayMs)
       }
-      logEvent('唤醒投递失败，换下一个候选: ' + target)
+      failures.push({ target: plan.target, reason: lastReason })
+      logEvent('唤醒投递失败，换下一个候选: ' + plan.target)
     }
-    return { ok: false, reason: '候选 ' + String(order.length) + ' 个全部发送失败（各重试 5 次后放弃）', candidates }
+    return { ok: false, reason: '候选 ' + String(order.length) + ' 个全部发送失败（失败原因：' + summarizeFailures(failures) + '）', candidates }
   }
 
   // 暴露为服务：watch profile 内其他插件（guardian）复用同一实现
@@ -575,8 +639,12 @@ export function apply(ctx: Context, config: Config): void {
       } else {
         const { sid: notifySid } = await pickNotifySid(info.sessionId)
         const report = '[守护] 预检通过（' + new Date().toLocaleTimeString() + '）——有配置变更请求重启 web，需爱丽丝确认。\n\n【预检报告】\n' + (pf.output.slice(0, 800) || '(无明细)') + '\n\n确认重启：调用 daemon_restart(reason)（哨兵将覆盖，守护执行重启）。拒绝/暂不：哨兵保留，不动 web。'
-        const delivered = notifySid ? await sendPrompt(notifySid, report) : false
-        logEvent(delivered ? '预检报告已送达爱丽丝（' + notifySid + '），等待确认（哨兵保留）' : '预检报告发送失败（无目标会话），哨兵保留')
+        // 2026-09-17：sendPrompt 改为返回 {ok, reason}——此处同步取 .ok，并把失败原因带进日志
+        const attempt = notifySid ? await sendPrompt(notifySid, report) : undefined
+        const delivered = attempt?.ok === true
+        logEvent(delivered
+          ? '预检报告已送达爱丽丝（' + String(notifySid) + '），等待确认（哨兵保留）'
+          : '预检报告发送失败（目标=' + String(notifySid ?? '无') + '，原因=' + (attempt?.reason ?? '无目标会话') + '），哨兵保留')
       }
     } catch (err) {
       logger.error('哨兵周期异常: ' + String(err))

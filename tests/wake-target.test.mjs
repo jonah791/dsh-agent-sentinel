@@ -46,10 +46,44 @@ test('rankUserSessions: 过滤子代理/空白，按最近活跃降序', () => {
   ])
 })
 
-test('尸体测试 A：钉住的旧锚点已滞后 63min → 改投最近活跃（我的会话），并给出理由', () => {
-  const d = decideWakeTarget(realCandidates(), 'session-89516696-bebe-40ea-a679-fb66fc5c09b1', NOW)
+test('尸体测试 A：钉住的旧锚点已滞后 63min → 改投最近活跃（我的会话），并给出理由（静态锚点模式 trustAnchor=false）', () => {
+  const d = decideWakeTarget(realCandidates(), 'session-89516696-bebe-40ea-a679-fb66fc5c09b1', NOW, { trustAnchor: false })
   assert.equal(d.sid, 'session-879c4ae1-b33e-43de-91d3-a968a6af6f2c')
   assert.match(d.why, /锚点腐化|滞后/)
+})
+
+test('触发者绑定（主人 2026-09-14 定调）：触发者跑长 turn 滞后 36min，也必须投给它', () => {
+  // 真实样本：2026-09-14 18:17 的 .watch-events.log —— 触发者 a5375716（滞后 36min），
+  // 旧判据（trustAnchor=false）改投 879c4ae1，主人因此永远收不到重启提醒。
+  const sessions = [
+    { sessionId: 'session-879c4ae1-b33e-43de-91d3-a968a6af6f2c', blank: false, updatedAt: NOW },
+    { sessionId: 'session-a5375716-1e98-4d44-84b3-e60dca22d1e2', blank: false, updatedAt: NOW - 36 * 60_000 },
+  ]
+  const d = decideWakeTarget(sessions, 'session-a5375716-1e98-4d44-84b3-e60dca22d1e2', NOW, { trustAnchor: true })
+  assert.equal(d.sid, 'session-a5375716-1e98-4d44-84b3-e60dca22d1e2', '触发者绑定：滞后不作为腐化证据')
+  assert.match(d.why, /触发者/)
+  // 对照：缺省（静态锚点语义）仍是旧的改投行为——两种语义都在，不是把旧行为删掉
+  assert.equal(
+    decideWakeTarget(sessions, 'session-a5375716-1e98-4d44-84b3-e60dca22d1e2', NOW).sid,
+    'session-879c4ae1-b33e-43de-91d3-a968a6af6f2c',
+  )
+})
+
+test('触发者绑定：触发者会话已不存在 → 仍回退最近活跃（不静默丢弃），理由保持可诊断', () => {
+  const sessions = [{ sessionId: 'session-me', blank: false, updatedAt: NOW }]
+  const d = decideWakeTarget(sessions, 'session-gone', NOW, { trustAnchor: true })
+  assert.equal(d.sid, 'session-me')
+  assert.match(d.why, /不在会话列表/)
+})
+
+test('触发者绑定：触发者是子代理/空白会话（不可 prompt）→ 回退最近活跃用户会话', () => {
+  const sessions = [
+    { sessionId: 'session-main', blank: false, updatedAt: NOW - 60_000 },
+    { sessionId: 'session-blank', blank: true, updatedAt: NOW },
+  ]
+  const d = decideWakeTarget(sessions, 'session-blank', NOW, { trustAnchor: true })
+  assert.equal(d.sid, 'session-main')
+  assert.match(d.why, /非用户会话/)
 })
 
 test('尸体测试 B：不带锚点时，最新是子代理会话 → 必须跳过它投给我（原事故：投子代理 → 5 次重试失败）', () => {
