@@ -249,6 +249,7 @@
   - 语义**被修正**：实测序列（`03:23:44` 触发者会话投递失败 → `03:23:59` 第二候选失败 → `03:24:19` 改投 `session-879c4ae1…` 成功）暴露三处：① `sendPrompt` 的 catch 吞掉全部失败原因、连 web 的 `result.ok=false` 也被丢弃 ⇒ **判不出「会话忙」还是「会话已被清掉」**（§5.22 五问③答不了）；② 首选（= **触发者**，也就是发起这次重启的那个会话）失败即刻换靶——而它的失败常是**瞬时**的（会话刚被打断 / 正在恢复），多等一轮胜过改投（代价是触发者永远收不到）；③ 改投**静默**：没有一行说明「本该发给 A，实际发给了 B」。
   - 修法（v0.1.2）：抽出 `src/wake-delivery.ts`（`planWakeAttempts` / `describeReject` / `summarizeFailures` / `isRerouted` / `rerouteNotice`，纯函数、零 IO）+ `sendPrompt` 改返回 `{ok, reason}`（**失败必带真实文案**）+ 首选多跑一轮（`primaryWaves=2`）+ 改投留痕与 telegram 告警；`promptAttempts` / `promptRetryDelayMs` 由硬编码变可配。**证据层先行**——答不了断点就先补证据，别先猜原因。
   - 取证：`.watch-events.log` 同段三行（含「换下一个候选」×2）+ 单测 `tests/wake-delivery.test.mjs` 7 项（含**事故形状复刻**：首选 2 轮败 → 次候选败 → 第三候选成功 ⇒ 判改投且告警含三要素）。
+  - **诚实注记（落账口径）**：本次提交（`b6dc67b`）**顺带落账**了 2026-09-14 起在工作区**悬置未提交**的 `trustAnchor` 改动（`src/wake-target.ts` + `tests/wake-target.test.mjs`）。线上 lib 早已构建并含该行为——同日 `03:23:44` 的「锚点是本次触发者 → 绑定投递（滞后 0s，不作为腐化证据）」即其证据。两者互补：`trustAnchor` 管「投给谁」，本次修复管「投不到怎么办」；全量测试 66/66 同时覆盖两者。
 
 ## 10 · 未决问题
 
@@ -260,4 +261,5 @@
 - **U6 用户会话判据靠 id 前缀是否够？** 若宿主改名，或派生会话改用 `session-` 前缀，`isUserSession` 会**静默失效**（线上表现为又投给不可 prompt 的对象）。是否需要第二判据（如 `delegationDepth === 0` / 会话 header）并在不一致时告警？
 - **U7 源码注释漂移未修**：`self-plugins/dsh-agent-sentinel/src/index.ts` 的 `SessionWakerService.wakeLatestSession` 文档注释仍描述旧行为（「只认它…绝不 fallback」），与 v2 实现相反。本次只报不改——需一次 sentinel 改动窗口同步注释与构建。
 - **U8 证据日志无轮转**：`.dsh/.watch-events.log` 现 11,492 行，且「候选列表」整行落盘（单行可达数 KB，实测单行数百至数千字符）。是否需要「候选只记前 3 个 + 总数」以压体积（代价：失去完整现场）？
+- **U9 改投后「触发者会话」自己要不要补一条？**（2026-09-17 新增）v0.1.2 已让**主人**可见（`唤醒改投:` 日志行 + telegram 告警），但被跳过的触发者会话——往往是刚被 web 重启打断、正要继续干活的那个——**自身仍不知道**这次唤醒发去了别处。可选：改投时追加一行到 `<DSH_HOME>/.wake-compensation.jsonl`，由 life-core 启动自检或该会话下次活跃时读回。**取舍**：多一个跨插件读取面 vs 少一次「我以为没人叫我」的静默。
 - **U9 锚点来源不统一**：写哨兵者有三处形态（plugin-manager `daemon_restart`（带会话 id + `daemon_restart:` 前缀）、plugin-manager `triggerReload`、dsh-panel 面板（**不带** id）），历史上还有配置钉住的 `mainSessionId` 流入。裁决层已兜住腐化锚点，但「上游该不该写锚点、写谁」尚无成文契约——是否统一为「只写当前会话，否则不写」？
