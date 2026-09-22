@@ -251,6 +251,11 @@
   - 取证：`.watch-events.log` 同段三行（含「换下一个候选」×2）+ 单测 `tests/wake-delivery.test.mjs` 7 项（含**事故形状复刻**：首选 2 轮败 → 次候选败 → 第三候选成功 ⇒ 判改投且告警含三要素）。
   - **诚实注记（落账口径）**：本次提交（`b6dc67b`）**顺带落账**了 2026-09-14 起在工作区**悬置未提交**的 `trustAnchor` 改动（`src/wake-target.ts` + `tests/wake-target.test.mjs`）。线上 lib 早已构建并含该行为——同日 `03:23:44` 的「锚点是本次触发者 → 绑定投递（滞后 0s，不作为腐化证据）」即其证据。两者互补：`trustAnchor` 管「投给谁」，本次修复管「投不到怎么办」；全量测试 66/66 同时覆盖两者。
 
+- **2026-09-22 D3 复核（**非语义漂移** · 仪器触发因说明）**
+  - **结论：本条语义未变，无实现改动。** 当日 `semantic_check` 对本条报 D3「实现比文档新：impl 最新 mtime `2026-09-22T04:41:37Z`」。逐项核对后确认：该 mtime **既不是任何 impl 落点，也不是本条 doc**，而是 **`twins` 之一**——`self-plugins/dsh-agent-sentinel/docs/semantic.md`（**另一条语义 web-lifecycle 的 doc**）在本地 12:41:37 被编辑所致。本条 6 个 impl 落点的实测 mtime 全部早于本次复核（最新 `src/index.ts` 09-17 13:00:18）。
+  - **机制**：D3 判据是「`impl + twins` 中最新的 mtime > doc mtime」（`dsh-semantic-docs/src/registry.ts:268`），而本条的 `twins` 含 sentinel 与 guardian 两份 `docs/semantic.md`。⇒ **编辑一份文档会让另一条语义报警**：当一个文件服务两条语义（此处是 twins 的"同语义副本"约定），任一方的编辑都会顶新共享的 mtime。
+  - ⇒ 归为 D3 的**第三种误报成因**（前两种：impl 清单文件粒度、工作区未提交改动），已并入任务板 `t-c54b41c6`。**本记录只做定性，不改本条任何契约内容**——这正是「不 touch 消警」的意思：复核的是"文档是否过时"，不是"如何让告警消失"。
+
 ## 10 · 未决问题
 
 - ~~**U1 换腿循环要不要抽纯函数 + 补单测？**~~ **已闭环（2026-09-17 · v0.1.2）**：抽出 `src/wake-delivery.ts`（编排 + 失败取证 + 改投文案，纯函数零 IO）+ 7 项单测（含尸体样本与事故形状），A18 升为「已实测」；U7（`SessionWakerService` 注释与 v2 行为相反）同批改正。
