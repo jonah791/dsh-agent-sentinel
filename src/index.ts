@@ -30,6 +30,7 @@ import {
   decideSentinelGate, pickLatestBuildMs, resolveWebStartMs,
   type PreflightRecord, type WebStartRecord,
 } from './preflight-gate.ts'
+import { shouldConsumeFlag } from './flag-consume.ts'
 import { createHash, createHmac } from 'node:crypto'
 import net from 'node:net'
 import type { Context } from '@deepseek-ai/cordis'
@@ -623,14 +624,27 @@ export function apply(ctx: Context, config: Config): void {
         try {
           await restartWeb(workspace)
           await decideAndWake(info.sessionId)
-          if (pendingFlagPath === flagPath) {
-            // 2026-08-31 审计 M1：周期内哨兵被重新 touch——保留 flag，由 finally 重新调度下一轮（不丢弃新触发）
-            logger.info('周期内哨兵被重新 touch，保留 flag 待下一轮: ' + flagPath)
-            logEvent('周期完成（期间哨兵被重新 touch，flag 保留待下一轮）')
+          // 2026-09-25 修复（4 次复现 + .watch-events.log 证据）：旧判据只看**路径**
+          // （`pendingFlagPath === flagPath`），而周期内 watcher 对该哨兵文件自身的任何事件都会走
+          // onFlag ⇒ pending 指向同一路径 ⇒ 成功重启后判成「期间被重新 touch」⇒ flag 不退场 ⇒
+          // 下一轮拿同一份 `daemon_restart:` 哨兵，其闸门判据（预检记录早于本轮 web 启动）在成功
+          // 重启后**必然**成立 ⇒ 每轮重启附赠一条误导性「daemon_restart 被拦」+ 哨兵滞留；
+          // 滞留期内若有人调过一次 preflight_check，这条陈旧哨兵就会真的再触发一次重启。
+          // 判据升级为**内容级**：内容与本轮开始时逐字节一致 ⇒ 自触发，消费掉；
+          // 内容变了 ⇒ 真·新触发，保留（2026-08-31 审计 M1 的本意不丢）。纯判据在 flag-consume.ts。
+          const samePath = pendingFlagPath === flagPath
+          const flagExists = existsSync(flagPath)
+          let contentUnchanged = false
+          try { contentUnchanged = flagExists && readFileSync(flagPath, 'utf8') === raw } catch { contentUnchanged = false }
+          if (!shouldConsumeFlag({ pendingSamePath: samePath, flagExists, contentUnchanged })) {
+            // 2026-08-31 审计 M1：内容已变 = 真·新触发——保留 flag，由 finally 重新调度下一轮（不丢弃）
+            logger.info('周期内哨兵被重新 touch（内容已变），保留 flag 待下一轮: ' + flagPath)
+            logEvent('周期完成（期间哨兵内容已变=真新触发，flag 保留待下一轮）')
           } else {
+            pendingFlagPath = null // 消费即止：清掉自触发的 pending，避免 finally 白跑一轮
             try { unlinkSync(flagPath) } catch { /* 已清理 */ }
             logger.info('哨兵已清理: ' + flagPath)
-            logEvent('周期完成，哨兵已清理')
+            logEvent(samePath ? '周期完成，哨兵已清理（期间事件为自触发：内容与本轮开始时一致）' : '周期完成，哨兵已清理')
           }
         } finally {
           const rel = clearLease(dshHome, 'sentinel')
