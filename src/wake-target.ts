@@ -157,3 +157,53 @@ export function pickNotifySession(sessions: readonly SessionLite[], nowMs: numbe
   const d = decideWakeTarget(sessions, undefined, nowMs)
   return { sid: d.sid, why: d.why }
 }
+
+/**
+ * 一轮 `session/list` 的就绪读数。
+ *
+ * 存在理由（2026-10-11 实测）：web 重启后 `session/list` 会有一段时间**返回空 items**
+ * ——实测两次重启一次等到 47.5s 才有列表（成功），一次等到 62s 仍为 0 条（唤醒失败，
+ * 且失败告警也挂了）⇒ 主人「重启完怎么没提醒了」的真因。
+ * 旧实现把这段等待**完全静默**（循环内零日志，只在退出后写一行）⇒ 47 秒是日志黑洞，
+ * 从外部判不出「web 没起好」还是「哨兵卡住」。本组纯函数把等待过程变成可读读数。
+ */
+export interface ListProbe {
+  /** 本轮 items 总条数（含子代理裸 uuid） */
+  total: number
+  /** 其中「用户会话」条数（可被人对话的 `session-*` 且非空白） */
+  userSessions: number
+}
+
+/**
+ * 统计一轮列表的读数。
+ * @param sessions - session/list 原始条目
+ */
+export function probeSessionList(sessions: readonly SessionLite[]): ListProbe {
+  return {
+    total: sessions.length,
+    userSessions: sessions.filter(isUserSession).length,
+  }
+}
+
+/**
+ * 读数指纹：**只在变化时留痕**的判据（空窗内读数恒为 `0/0` ⇒ 只写一行）。
+ * @param probe - 本轮读数
+ */
+export function probeSignature(probe: ListProbe): string {
+  return String(probe.total) + '/' + String(probe.userSessions)
+}
+
+/**
+ * 等待留痕文本（人类可读，含轮次、读数、已等/预算）。
+ * @param probe - 本轮读数
+ * @param round - 第几轮（1 起）
+ * @param waitedMs - 已等待毫秒
+ * @param budgetMs - 等待预算毫秒
+ */
+export function formatWaitTrace(probe: ListProbe, round: number, waitedMs: number, budgetMs: number): string {
+  const waited = Math.round(Math.max(0, waitedMs) / 1000)
+  const budget = Math.round(Math.max(0, budgetMs) / 1000)
+  return '等待会话列表就绪: items=' + String(probe.total)
+    + ' 用户会话=' + String(probe.userSessions)
+    + '（第 ' + String(round) + ' 轮，已等 ' + String(waited) + 's/' + String(budget) + 's）'
+}

@@ -16,7 +16,7 @@ import { watch as fsWatch, existsSync, readFileSync, unlinkSync, writeFileSync, 
 import { join, dirname, basename, resolve } from 'node:path'
 import { spawn, execFile, type ChildProcess } from 'node:child_process'
 import { sendTelegramAlert } from './alert-transport.ts'
-import { decideWakeTarget, type SessionLite } from './wake-target.ts'
+import { decideWakeTarget, probeSessionList, probeSignature, formatWaitTrace, type SessionLite } from './wake-target.ts'
 import {
   describeReject,
   isRerouted,
@@ -57,6 +57,19 @@ export interface Config {
   baseUrl: string
   /** 重启后等待 web 就绪的时限（ms）。 */
   readyTimeoutMs: number
+  /**
+   * 等「会话列表出现用户会话」的预算（ms）。
+   *
+   * 2026-10-11：原为函数体里硬编码的 60_000，实测不足——web 重启后 `session/list`
+   * 返回空 items 的窗口**可达 62 秒**（14:42 那次唤醒因此彻底失败，且告警也挂了）。
+   */
+  listWaitMs: number
+  /** 会话列表轮询间隔（ms）。 */
+  listPollMs: number
+  // ⚠ 本 interface 与文件下方 `const Config = z.object({...})` **双写**（既有惯例，非本文件独有）：
+  //    - 只改 schema 不改这里 ⇒ **编译报错**（TS 的 config 类型只认本 interface；2026-10-11 实测踩到）；
+  //    - 只改这里不改 schema ⇒ **静默**（运行时按 schema 解析，新字段永远拿不到配置值）。
+  //    同步判据：两处的字段名集合必须逐一相等。
   /** 事故文件路径。 */
   incidentFile: string
   /** workspace 兜底。 */
@@ -92,6 +105,17 @@ export const Config = z.object({
   port: z.number().default(3080),
   baseUrl: z.string().default('http://127.0.0.1:3080'),
   readyTimeoutMs: z.number().default(30000),
+  /**
+   * 等「会话列表出现用户会话」的预算（ms）。
+   *
+   * 2026-10-11 由硬编码 60_000 提为配置并放宽到 180_000：实测 web 重启后
+   * `session/list` 返回空 items 的窗口**可达 62 秒**——14:42 那次等到 62s 仍是
+   * `候选 0 条` ⇒ 唤醒彻底失败（主人什么也没收到），而 15:03 那次 47.5s 刚好赶上。
+   * 原上限 60s 正卡在实测边界上：**能否唤醒取决于 web 这次起得快不快**，不可接受。
+   */
+  listWaitMs: z.number().default(180000),
+  /** 会话列表轮询间隔（ms）。 */
+  listPollMs: z.number().default(3000),
   incidentFile: z.string().default(''),
   defaultWorkspace: z.string().default(''),
   debounceMs: z.number().default(300),
@@ -413,16 +437,28 @@ export function apply(ctx: Context, config: Config): void {
     if (!(await waitWebReady(opts.waitWebReadyMs ?? config.readyTimeoutMs))) {
       return { ok: false, reason: 'web 未在时限内就绪', candidates: [] }
     }
-    const MAX_WAIT_MS = 60_000
+    const MAX_WAIT_MS = Math.max(1000, Math.trunc(config.listWaitMs))
+    const pollMs = Math.max(200, Math.trunc(config.listPollMs))
     const startedWait = Date.now()
     let sessions: SessionLite[] = []
     let decision: { sid: string | undefined; why: string; ranked: string[] } = { sid: undefined, why: '未裁决', ranked: [] }
+    // 2026-10-11：等待过程留痕（**只在读数变化时**写，空窗内最多两行——首轮 + 列表出现那轮）。
+    // 旧实现循环内零日志 ⇒ 47.5 秒的黑洞，外部判不出「web 没起好」还是「哨兵卡住」。
+    let round = 0
+    let lastSig = ''
     for (;;) {
+      round += 1
       sessions = await listSessions()
       decision = pickTarget(sessions, explicitId)
       if (decision.sid !== undefined) break
+      const probe = probeSessionList(sessions)
+      const sig = probeSignature(probe)
+      if (sig !== lastSig) {
+        lastSig = sig
+        logEvent(formatWaitTrace(probe, round, Date.now() - startedWait, MAX_WAIT_MS))
+      }
       if (Date.now() - startedWait >= MAX_WAIT_MS) break
-      await sleep(3000)
+      await sleep(pollMs)
     }
     const candidates = sessions.map((s) => String(s.sessionId ?? '?'))
     if (decision.sid === undefined) {

@@ -8,6 +8,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   decideWakeTarget, pickNotifySession, isUserSession, rankUserSessions, toMs, DEFAULT_ANCHOR_STALE_MS,
+  probeSessionList, probeSignature, formatWaitTrace,
 } from '../lib/wake-target.js'
 
 const NOW = Date.parse('2026-09-12T13:47:46.000Z')
@@ -139,4 +140,49 @@ test('pickNotifySession: 与无锚点裁决一致（守护/预检通道共用）
   const r = pickNotifySession(realCandidates(), NOW)
   assert.equal(r.sid, 'session-879c4ae1-b33e-43de-91d3-a968a6af6f2c')
   assert.match(r.why, /最近活跃用户会话/)
+})
+
+// ---------- 2026-10-11：等待会话列表就绪的读数（主人「重启完怎么没提醒了」的真因） ----------
+// 事件：web 重启后 session/list 有一段时间返回**空 items**——14:42 那次等到 62s 仍 `候选 0 条`
+// （唤醒彻底失败），15:03 那次 47.5s 列表出现（成功）。旧实现这段等待**零日志** ⇒ 黑洞。
+
+test('probeSessionList: 空窗读数（真实样本：14:42 那次 session/list 返回 0 条）', () => {
+  const p = probeSessionList([])
+  assert.deepEqual(p, { total: 0, userSessions: 0 })
+})
+
+test('probeSessionList: 混合列表分别计总数与用户会话数（子代理裸 uuid 不计入用户会话）', () => {
+  const p = probeSessionList(realCandidates())
+  assert.equal(p.total, 5)
+  assert.equal(p.userSessions, 2)
+})
+
+test('probeSignature: 空窗内指纹恒定 —— 这是「只在变化时留痕」的判据（60+ 秒空窗只写一行，不刷屏）', () => {
+  const a = probeSignature(probeSessionList([]))
+  const b = probeSignature(probeSessionList([]))
+  assert.equal(a, b, '连续两轮空窗必须同指纹，否则每 3 秒都会写一行')
+  const withList = probeSignature(probeSessionList(realCandidates()))
+  assert.notEqual(a, withList, '列表出现是一次状态变化，必须可测出来')
+})
+
+test('probeSignature: 逐条填充的过程可分辨（0 → 2 → 5 是三次变化，各留一行）', () => {
+  const sigs = [
+    probeSignature(probeSessionList([])),
+    probeSignature(probeSessionList(realCandidates().slice(0, 2))),
+    probeSignature(probeSessionList(realCandidates())),
+  ]
+  assert.equal(new Set(sigs).size, 3)
+})
+
+test('formatWaitTrace: 留痕文本含全部诊断读数（items / 用户会话 / 轮次 / 已等与预算）', () => {
+  const t = formatWaitTrace({ total: 0, userSessions: 0 }, 16, 47_500, 180_000)
+  assert.match(t, /items=0/)
+  assert.match(t, /用户会话=0/)
+  assert.match(t, /第 16 轮/)
+  assert.match(t, /已等 48s\/180s/)
+})
+
+test('formatWaitTrace: 负数/超预算输入不产出负秒（fail-loud 之外的边界不静默）', () => {
+  const t = formatWaitTrace({ total: 0, userSessions: 0 }, 1, -5, -1)
+  assert.match(t, /已等 0s\/0s/)
 })
