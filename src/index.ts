@@ -234,10 +234,14 @@ export function apply(ctx: Context, config: Config): void {
   if (!config.telegramBotToken || !config.telegramChatId) {
     try {
       const cred = readFileSync(join(dshHome, '.credentials.yaml'), 'utf8')
-      const m = cred.match(/^\s*TELEGRAM_BOT_TOKEN:\s*(\S+)/m)
-      if (m && m[1] && !config.telegramBotToken) config.telegramBotToken = m[1]
-      const mc = cred.match(/^\s*TELEGRAM_CHAT_ID:\s*(\S+)/m)
-      if (mc && mc[1] && !config.telegramChatId) config.telegramChatId = mc[1]
+      // ⚠ YAML 引号必须清洗（2026-10-11 修复，与 notify/guardian 同款）：`(\S+)` 会把值的
+      //   双引号吃进 token ⇒ Telegram API 返 404。正则照抄 `dsh-agent-telegram`（它 2026-09-07 修过）。
+      const m = cred.match(/^\s*TELEGRAM_BOT_TOKEN:\s*(?:"([^"]+)"|'([^']+)'|(\S+))/m)
+      const tok = (m && (m[1] ?? m[2] ?? m[3])) ?? ''
+      if (tok && !config.telegramBotToken) config.telegramBotToken = tok
+      const mc = cred.match(/^\s*TELEGRAM_CHAT_ID:\s*(?:"([^"]+)"|'([^']+)'|(\S+))/m)
+      const chat = (mc && (mc[1] ?? mc[2] ?? mc[3])) ?? ''
+      if (chat && !config.telegramChatId) config.telegramChatId = chat
     } catch { /* 无凭据文件 */ }
   }
 
