@@ -1,6 +1,6 @@
 # 语义文档：唤醒与通知投递（Wake & Notification Delivery）
 
-> 版本 v0.1 · 2026-09-13 · 作者：爱丽丝 · 状态：implemented（22 条验收：19 已取证 / 3 待线上验收）
+> 版本 v0.1.1 · 2026-10-11 · 作者：爱丽丝 · 状态：implemented（24 条验收：22 已取证 / 2 待线上验收）
 > 开发方式：语义文档优先（先写清「是什么 / 什么关系 / 怎么裁决」，再让实现逼近，最后用实践回修）
 > 主实现落点：`self-plugins/dsh-agent-sentinel/src/wake-target.ts`（裁决纯函数）+ `self-plugins/dsh-agent-sentinel/src/index.ts`（编排/投递/证据）
 > 消费方落点：`self-plugins/dsh-agent-guardian/src/index.ts`（`notifyWebReady`，经 `ctx.sessionWaker` 可选消费）
@@ -15,26 +15,23 @@
 |------|-----|
 | 能力名 | 唤醒与通知投递（wake-delivery）|
 | 主副本 | 本文件（`self-plugins/dsh-agent-sentinel/docs/semantic-wake-delivery.md`）|
-| 版本 / 状态 | v0.1 / implemented（3 条待线上验收，见 §7；pending 未归零不得晋升 verified）|
+| 版本 / 状态 | v0.1.1 / implemented（2 条待线上验收，见 §7；pending 未归零不得晋升 verified）|
 | owners | `dsh-agent-sentinel`（实现 + 服务提供方）、`dsh-agent-guardian`（消费方）|
 | 对应插件版本 | sentinel v0.1.1、guardian v0.1.1（见各自 `package.json`）|
 | 同语义副本（交叉指认）| `self-plugins/dsh-agent-guardian/docs/semantic.md`（守护侧文档写「唤醒」这一调用点与让位语义，本文写裁决与投递全链；两份不得平行维护同一条规则）|
 | 租约语义 | **不在本文**：租约文件格式/裁决表/TTL/边界的主副本是 `self-plugins/dsh-agent-sentinel/docs/semantic.md`（条目 `web-lifecycle`）。本文只写「投递侧如何受租约约束」|
 | 关联规则 | AGENTS.md §5.18（唤醒/通知投递纪律）、§5.19（单点所有权纪律）、§5.10 §3–§4（不静默 / 重试告警）、§5.2（watch 重启归主人）|
-| 复核时间 | 2026-09-13 |
+| 复核时间 | 2026-10-11 |
 
 ## 2 · 定位与反定位
 
-**定位**：定义「一条提醒/通知如何落到**我此刻在的那个会话**」的端到端语义——
-目标裁决（谁是用户会话、锚点什么时候还算数、腐化后投给谁）、候选换腿与重试上限、
-失败分支（禁止静默放弃）、保活路径与哨兵路径如何共用同一实现、以及投递如何受
-**web 生命周期单点所有权（租约让位）**约束。一句话：**投递不是「找得到会话就发」，是「裁决出唯一正当目标并留痕」。**
+**定位**：定义「一条提醒/通知如何落到**我此刻在的那个会话**」的端到端语义—— 目标裁决（谁是用户会话、锚点什么时候还算数、腐化后投给谁）、候选换腿与重试上限、 失败分支（禁止静默放弃）、保活路径与哨兵路径如何共用同一实现、以及投递如何受 **web 生命周期单点所有权（租约让位）**约束。一句话：**投递不是「找得到会话就发」，是「裁决出唯一正当目标并留痕」。**
 
 **反定位（本文不含什么）**：
 
 - **不管租约本身**——租约文件格式、`decideLeaseGate` 裁决表、TTL、坏数据口径的主副本在 `web-lifecycle`（sentinel `docs/semantic.md`）。本文只写接管点：守护在「唤醒前」查租让位（§5.4）。
 - **不管 web 进程生命周期**——kill/spawn/收养/预检 gate 归 `dsh-agent-sentinel`（协调）与 `dsh-agent-guardian`（保活）；本文只管「重启完成后那一条消息往哪投」。
-- **不管 web 的就绪判定细则**——`/api/session/list` 的认证（browser-auth cookie）与 API 形态归 DSH 本体；本文只依赖「`result.ok === true` 即就绪」。
+- **不管 web 的就绪判定细则**——`/api/session/list` 的认证（browser-auth cookie）与 API 形态归 DSH 本体；本文只依赖「该 RPC 能应答」这一层，`items` 是否有内容由 I5 第二层的等待预算（`listWaitMs`）处理。
 - **不管消息内容语义**——正文由调用方给（哨兵「web 已重启，请继续」/ 守护「web 已拉起」/ 预检报告）。
 - **不是 IM / 不是推送系统**——没有队列、没有送达确认回执、没有重发窗口；投递是**一次编排内的尽力而为 + 证据留痕**。
 - **不保证必达**——I3 优先级高于必达：候选不可用时**宁可不投**（返回 `ok=false` + 理由），也不投「看起来像会话」的东西。
