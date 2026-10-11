@@ -70,6 +70,10 @@
       ① waitWebReady(readyTimeoutMs)  ── 未就绪 ──► ok=false「web 未在时限内就绪」
                                    │                 └─ 哨兵侧：incident + telegram
                                    ▼
+      ①' 列表就绪轮询（I5 第二层）：listSessions() 直到出现「用户会话」
+             预算 listWaitMs（缺省 180s）× 间隔 listPollMs（缺省 3s）
+             └─ 预算耗尽仍 0 条 ──► ok=false「不误投」；过程只在读数变化时留痕（I9）
+                                   ▼
       ② listSessions() → decideWakeTarget(sessions, explicitId, nowMs)   ← 纯函数，可注入时间
              ├─ 无用户会话 ─────────────► sid=undefined「不投递」（绝不误投）
              ├─ 无锚点 ─────────────────► 最近活跃用户会话 + 理由
@@ -93,10 +97,11 @@
 2. **I2 锚点不是真源**：锚点只在**新鲜**时优先；腐化 / 不在列表 / 是派生会话 → 改投最近活跃用户会话，且理由必须落盘（「为什么改投」可回答）。
 3. **I3 不误投优先于必达**：无正当候选时**不投递**（`ok=false` + 理由），不 fallback 到「看起来像会话」的对象。
 4. **I4 不静默放弃**：每次裁决有理由行；每次换腿有失败行；每次整体失败有 `ok=false` 的 reason 与候选清单（哨兵侧再升 incident + telegram）。
-5. **I5 就绪先行**：web 未在预算内就绪（`/api/session/list` 不返回 `result.ok === true`）→ 不投递。
+5. **I5 就绪分两层**：① **RPC 层**——`/api/session/list` 未在 `readyTimeoutMs` 内返回 `result.ok === true` → 不投递；② **内容层**——RPC 已通但 `items` 尚空（宿主重启后的就绪窗口**实测可达 60+ 秒**）→ 继续轮询至 `listWaitMs` 预算耗尽，仍空才判不投递。**「ok 通了」≠「列表有内容」**：同一个 RPC 的两层，混为一谈会让唤醒在重启后静默失败（2026-10-11 真因，见 §9）。
 6. **I6 单一实现**：唤醒只有一份实现 `ctx.sessionWaker`（sentinel 提供、guardian 可选消费）——两条路径不得各写一份（历史教训：拆分时能力丢失）。
 7. **I7 一次生命周期动作只产生一条唤醒**：持租方唤醒、让位方不唤醒（租约语义主副本见 `web-lifecycle`）。
 8. **I8 坏数据不锁死**：租约损坏 / 空 / 时钟偏移一律放行 + 落 issue 行；**不因坏数据停在半路**。
+9. **I9 等待要留痕但不刷屏**：等待过程**只在读数指纹（总数/用户会话数）变化时**落一行——留痕是为了事后回答「那段空窗里发生了什么」，但一次 47 秒等待**不许写成 16 行**噪音（对数 MB 的 `.watch-events.log` 而言，这两条要求方向相反，故以「变化才写」同时满足；见 U8）。
 
 ## 5 · 契约
 
@@ -109,6 +114,8 @@
 | `nowMs` | 调用时刻 | **只用于理由文本**（`ageText`）——不参与裁决判定，故裁决可离线注入时间做尸体测试 |
 | `readyTimeoutMs` | sentinel 配置（watch profile 现值 `90000`）| 就绪等待预算 |
 | `waitWebReadyMs` | 调用方可覆盖 | 同上（守卫/哨兵可各自收窄）|
+| `listWaitMs` | sentinel 配置（缺省 `180000`）| **列表就绪**等待预算：轮询等「出现用户会话」的上限。原为硬编码 60s，恰落在实测空窗边界上（14:42 那次等 62s 仍 0 条 ⇒ 唤醒彻底失败）⇒ 2026-10-11 放宽 + 配置化 |
+| `listPollMs` | sentinel 配置（缺省 `3000`）| 轮询间隔；与 `listWaitMs` 共同决定轮次（成功那次等 47.5s ≈ 16 轮 × 3s，实测吻合）|
 
 ### 5.2 裁决表（`decideWakeTarget`）
 
@@ -132,7 +139,10 @@
 | `toMs(value) → number` | 同上 | `> 1e12` 视为毫秒，否则按秒 ×1000；`undefined`/非有限 → `0` |
 | `decideWakeTarget(sessions, explicitId, nowMs, {anchorStaleMs?}) → {sid, why, ranked}` | 同上 | 纯函数（无 IO、时间可注入）；`ranked` 为候选 id 序列（换腿用）|
 | `pickNotifySession(sessions, nowMs) → {sid, why}` | 同上 | 等价「无锚点裁决」，通知通道专用 |
-| `wakeLatestSession(text, {explicitId?, waitWebReadyMs?}) → WakeResult` | `src/index.ts` | 就绪等待 → 裁决（最多等 60s 出现候选）→ 最多 3 候选 × 各 5 次重试；`ctx.provide('sessionWaker', …)` 暴露 |
+| `wakeLatestSession(text, {explicitId?, waitWebReadyMs?}) → WakeResult` | `src/index.ts` | 就绪等待（两层，见 I5）→ **列表就绪轮询**（至多 `listWaitMs`，间隔 `listPollMs`）→ 裁决 → 最多 3 候选 × 各 5 次重试；`ctx.provide('sessionWaker', …)` 暴露 |
+| `probeSessionList(sessions) → {total, userSessions}` | `src/wake-target.ts` | 列表读数：总数 + 用户会话数（非数组输入按 0 计）——「空窗里到底有没有东西」的可读数形式 |
+| `probeSignature(probe) → string` | 同上 | `"<total>/<userSessions>"`——**留痕的门**：只有签名变化才写日志（I9 的判据，纯函数故可离线断言）|
+| `formatWaitTrace(probe, round, waitedMs, budgetMs) → string` | 同上 | 等待留痕文案（含读数 / 轮次 / 已等 / 预算；负数归零）|
 | `checkLeaseFor(dshHome, role, nowMs) → LeaseGate & {issue?}` | `src/lease.ts`（副本在 guardian）| 守护侧唯一让位查询入口；裁决表见 `web-lifecycle` 文档 |
 
 ### 5.4 调用点清单 `[MUST]`
@@ -154,7 +164,7 @@
 
 | 落点 | 形状 | 语义 |
 |------|------|------|
-| `<DSH_HOME>/.watch-events.log`（追加行）| `唤醒目标裁决: <why> → 尝试顺序=[…]` / `唤醒决策: explicit=… 候选=[…] → <sid|未发送>` / `唤醒消息已发送: <sid>` / `唤醒未发送: <reason>` / `唤醒投递失败，换下一个候选: <sid>` / `通知目标裁决: <why>` / `拉起后唤醒已发送: <sid>` / `拉起后唤醒未发送: <reason>（候选=[…]）` / `生命周期租约: …` | 每次裁决与投递都可在日志里复原（I4）；候选列表整行落盘（体积问题见 U8）|
+| `<DSH_HOME>/.watch-events.log`（追加行）| `唤醒目标裁决: <why> → 尝试顺序=[…]` / `唤醒决策: explicit=… 候选=[…] → <sid|未发送>` / `唤醒消息已发送: <sid>` / `唤醒未发送: <reason>` / `唤醒投递失败，换下一个候选: <sid>` / `通知目标裁决: <why>` / `拉起后唤醒已发送: <sid>` / `拉起后唤醒未发送: <reason>（候选=[…]）` / `生命周期租约: …` / `等待列表就绪: <total>/<userSessions> 第 N 轮 已等 Xs（预算 Ys）` | 每次裁决与投递都可在日志里复原（I4）；候选列表整行落盘（体积问题见 U8）；**等待留痕 2026-10-11 起改为「读数变化才写」**（I9）——一次 47 秒空窗最多两行（首轮 + 列表出现那轮）|
 | `<DSH_HOME>/.watch-incident.json`（覆盖式快照）| `{at, message, …}` | 唤醒未能完成的上报（「未就绪」/「未能唤醒目标会话」）|
 | `.dsh/.web-lifecycle-lease.json` | `{owner, atMs, ttlMs, note?}` | 让位判据；语义主副本见 `web-lifecycle` |
 | web `/api/session/prompt` | `{mode:'steer', sessionId, content:[{type:'text',text}]}` | 投递通道；成功判据 `result.ok === true` |
@@ -168,7 +178,7 @@
 | 失败面场景 | 行为 |
 |-----------|------|
 | web 未在 `readyTimeoutMs` 内就绪 | 返回 `ok=false`；哨兵侧 incident + telegram；守护侧证据行 |
-| 列表内无用户会话 | 等待至多 60s 轮询 → 仍无 → `ok=false`「不误投」 |
+| 列表内无用户会话 | 轮询至多 `listWaitMs`（缺省 180s；原硬编码 60s 恰卡在实测空窗边界） → 仍无 → `ok=false`「不误投」 |
 | 首选候选 3 个全失败 | `ok=false`（reason 含候选数与「各重试 5 次后放弃」）→ 哨兵侧 incident + telegram |
 | 单个候选 `session/prompt` 抛错 | 计入该候选的 5 次重试；**不冒泡**（不影响后续候选）|
 | 锚点腐化 / 不在列表 / 是派生会话 | 改投最近活跃用户会话 + 理由行 |
@@ -204,8 +214,10 @@
 | A20 | 坏租约（JSON 损坏 / 空 / shape 非法 / 时钟偏移）一律放行且留 issue，不锁死服务 | ✔ 同文件（`lease-json-invalid` / `lease-empty` / `clock-skew` 等分支各有断言）|
 | A21 | 不得夺权：guardian 清不掉 sentinel 的租约；释放写「已释放」留痕而非删文件 | ✔ 同文件（`not-owner(current=sentinel)`；读回 `ttlMs=1` + `note=released-at-<ts>`）|
 | A22 | 一次重启只产生一条唤醒（让位语义在线上生效）| 待线上验收：`.dsh/.watch-events.log` 中 `生命周期租约` 命中 **0**、`.dsh/.web-lifecycle-lease.json` **不存在** ⇒ live 未执行租约路径（watch PID 19000 启动 2026-09-12 22:14:05 < lib 构建 22:55:33；watch profile 虽配了 HMR（root=`E:/alice/self-plugins`），日志中未见其接管该构建），2026-09-13T03:20:31 双唤醒重现（哨兵 `.598` / 守护 `.888`）——见 U2 |
+| A23 | 列表就绪等待窗口可配置，且缺省足以覆盖实测空窗（60+ 秒）| ✔ `src/index.ts` 新增 `listWaitMs`（缺省 180000）/ `listPollMs`（缺省 3000），替代原 `MAX_WAIT_MS = 60_000` 硬编码；契约对账 `_tmp_review/sentinel-config-parity.mjs` 断言 Config 手写 interface 与 zod schema 字段集双向一致（22=22，两向差集皆空，含尸体样本自检）|
+| A24 | 等待过程只在读数变化时留痕（一次 47 秒空窗最多两行，不得刷成 16 行）| ✔ `node --test tests/wake-target.test.mjs` → 76 pass / 0 fail，含「probeSignature: 读数不变则签名不变（空窗不刷屏）」「逐条填充可分辨」「formatWaitTrace 含全部读数」「负数归零」|
 
-**验收计数**：total **22** / proven **20** / pending **2**（A18 于 2026-09-17 首次线上实测并修复三处缺陷后转入 proven；余 A17 / A22 待线上验收）。
+**验收计数**：total **24** / proven **22** / pending **2**（A18 于 2026-09-17 线上实测后转 proven；A23/A24 于 2026-10-11 新增并当场实测 proven；余 A17 / A22 待线上验收）。
 
 ## 8 · 与实现的关系
 
@@ -256,6 +268,14 @@
   - **机制**：D3 判据是「`impl + twins` 中最新的 mtime > doc mtime」（`dsh-semantic-docs/src/registry.ts:268`），而本条的 `twins` 含 sentinel 与 guardian 两份 `docs/semantic.md`。⇒ **编辑一份文档会让另一条语义报警**：当一个文件服务两条语义（此处是 twins 的"同语义副本"约定），任一方的编辑都会顶新共享的 mtime。
   - ⇒ 归为 D3 的**第三种误报成因**（前两种：impl 清单文件粒度、工作区未提交改动），已并入任务板 `t-c54b41c6`。**本记录只做定性，不改本条任何契约内容**——这正是「不 touch 消警」的意思：复核的是"文档是否过时"，不是"如何让告警消失"。
 
+- **2026-10-11 「重启完怎么没提醒了」→ 就绪判据分层（I5）+ 等待留痕（I9）**
+  - 语义**被修正（判据分层）**：原 I5 只判 RPC 层（`result.ok === true`），而 `wakeLatestSession` 取的是**内容层**（`result.value.items`）——同一个 RPC 的两层被当成一层。宿主重启后的就绪窗口里 RPC 已应答而 `items` 仍空，「已就绪」于是被误判成立，唤醒在 60s 上限内空转后失败。
+  - **真因（三条独立证据）**：① 代码——`for(;;){ listSessions(); pickTarget(); if(sid) break; if(elapsed >= MAX_WAIT_MS) break; sleep(3000) }`，`MAX_WAIT_MS = 60_000` 硬编码；② 时间——成功那次等到 47.5s 列表出现 ≈ 16 轮 × 3s，完全吻合；③ 现场——`.watch-events.log` 真实两行「候选 0 条，但无『用户会话』」与「等待 62s 后仍无可用用户会话」。⇒ **14:42 那次等满 62s 仍 0 条（唤醒彻底失败，主人什么也没收到），15:03 那次 47.5s 成功**——能否唤醒取决于 web 这次起得快不快，而上限恰卡在边界上。
+  - **排除项**：不是单次 fetch 挂起（`apiRpc` 带 `AbortSignal.timeout(10000)`）；不是投递慢；不是重启慢（重启段仅 5 秒）。
+  - 修法：① 上限配置化并放宽（`listWaitMs` 180s / `listPollMs` 3s）；② 等待过程**只在读数指纹变化时留痕**（消除 47 秒里 16 行的日志噪音，同时保住「那段空窗发生了什么」的可回答性）；③ 纯函数层加 `probeSessionList` / `probeSignature` / `formatWaitTrace` + 6 个用例。
+  - **附带定论（另一条通道）**：失败告警当时**也**没送到——watch 侧 telegram token 被 API 直接拒（`getMe` → `401 Unauthorized`）⇒ **token 本身不可用**（已被 revoke / bot 已删），**不是**引号污染（那是 404，见本日早先的凭据清洗提交）。⇒「唤醒失败」+「告警也失败」叠加，才表现为主人那边**完全静默**。修复需一份有效凭据（属须请示项）。
+  - **诚实注记**：本次改动**尚未在 live watch 进程生效**——watch 的更新/重启归主人（§5.2）。未重启前线上仍是 60s 上限 + 每轮一条留痕。A23/A24 是**代码与单测层**证据，运行层待重启后复验。
+
 ## 10 · 未决问题
 
 - ~~**U1 换腿循环要不要抽纯函数 + 补单测？**~~ **已闭环（2026-09-17 · v0.1.2）**：抽出 `src/wake-delivery.ts`（编排 + 失败取证 + 改投文案，纯函数零 IO）+ 7 项单测（含尸体样本与事故形状），A18 升为「已实测」；U7（`SessionWakerService` 注释与 v2 行为相反）同批改正。
@@ -265,6 +285,7 @@
 - **U5 新鲜度是「相对滞后」而非「绝对年龄」**：若最近活跃用户会话本身已 N 小时无更新（长时间无人交互），锚点同样被判「新鲜」→ 仍会投给一个可能没人在看的会话。是否引入「绝对年龄上限」（如候选 `updatedAt` 距今 > 12h 则改发 telegram 而不投会话）？
 - **U6 用户会话判据靠 id 前缀是否够？** 若宿主改名，或派生会话改用 `session-` 前缀，`isUserSession` 会**静默失效**（线上表现为又投给不可 prompt 的对象）。是否需要第二判据（如 `delegationDepth === 0` / 会话 header）并在不一致时告警？
 - **U7 源码注释漂移未修**：`self-plugins/dsh-agent-sentinel/src/index.ts` 的 `SessionWakerService.wakeLatestSession` 文档注释仍描述旧行为（「只认它…绝不 fallback」），与 v2 实现相反。本次只报不改——需一次 sentinel 改动窗口同步注释与构建。
-- **U8 证据日志无轮转**：`.dsh/.watch-events.log` 现 11,492 行，且「候选列表」整行落盘（单行可达数 KB，实测单行数百至数千字符）。是否需要「候选只记前 3 个 + 总数」以压体积（代价：失去完整现场）？
+- **U8 证据日志无轮转**：`.dsh/.watch-events.log` 现 11,492 行，且「候选列表」整行落盘（单行可达数 KB，实测单行数百至数千字符）。是否需要「候选只记前 3 个 + 总数」以压体积（代价：失去完整现场）？**2026-10-11 更新**：文件已涨到 **4.2 MB**；本次已把**等待留痕**改为「读数变化才写」（I9）——体积问题的一条正面对策已落地，但「候选列表整行落盘」等其他形状仍未动，本节问题**未闭环**。
 - **U9 改投后「触发者会话」自己要不要补一条？**（2026-09-17 新增）v0.1.2 已让**主人**可见（`唤醒改投:` 日志行 + telegram 告警），但被跳过的触发者会话——往往是刚被 web 重启打断、正要继续干活的那个——**自身仍不知道**这次唤醒发去了别处。可选：改投时追加一行到 `<DSH_HOME>/.wake-compensation.jsonl`，由 life-core 启动自检或该会话下次活跃时读回。**取舍**：多一个跨插件读取面 vs 少一次「我以为没人叫我」的静默。
 - **U9 锚点来源不统一**：写哨兵者有三处形态（plugin-manager `daemon_restart`（带会话 id + `daemon_restart:` 前缀）、plugin-manager `triggerReload`、dsh-panel 面板（**不带** id）），历史上还有配置钉住的 `mainSessionId` 流入。裁决层已兜住腐化锚点，但「上游该不该写锚点、写谁」尚无成文契约——是否统一为「只写当前会话，否则不写」？
+- **U10 失败告警通道本身就曾失效（凭据层）**（2026-10-11 新增）：watch 侧 telegram token 被 API 直接拒（`getMe` → `401 Unauthorized`）⇒ 唤醒失败的告警**送不出去**——最需要告警的时刻恰是通道坏的时刻（**双重静默**：事情没成，且没人知道）。修复需一份**有效凭据**，属须请示项、归主人裁决；在那之前 watch 侧告警应视为**不可用**，不得把「已发告警」当既成事实。**附带问题**：`dsh-agent-sentinel` / `dsh-agent-notify` / `dsh-agent-telegram` 是三份**复制实现**各自读配置与清洗，凭据的新鲜度**无人对账**——今天这份坏了，另两份是好的还是坏的，没有一处能回答。
