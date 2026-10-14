@@ -19,6 +19,8 @@ import { sendTelegramAlert } from './alert-transport.ts'
 import { decideWakeTarget, probeSessionList, probeSignature, formatWaitTrace, type SessionLite } from './wake-target.ts'
 import {
   describeReject,
+  classifySessionList,
+  summarizeFailedAttempts,
   isRerouted,
   planWakeAttempts,
   rerouteNotice,
@@ -368,14 +370,35 @@ export function apply(ctx: Context, config: Config): void {
     return false
   }
 
+  /**
+   * 读会话列表。
+   *
+   * ★ 2026-10-14 修复（根因级）：修前这里是 `try { … } catch { return [] }` ——
+   *   **把认证失败（401 `unauthorized`）吞成了「空列表」**。后果不是「读不到」，
+   *   是**把 401 读成了「web 还没起好」**：调用方见 `items=0` 就继续等 60 秒
+   *   （日志写「等待会话列表就绪」），而真相是**认证已经失败**。
+   *   ⇒ 现场（2026-10-14 06:01:39）就是这么走的，且**外部判不出**（日志只说「items=0」）。
+   *
+   * 纪律（§5.22 五问③「断在哪一段」）：**失败必须带原因，不许吞**。
+   *   空列表仍返回 `[]`（调用方契约不变），但**每次都记一行**，让「认证失败」与
+   *   「真的没有会话」在日志里**长得不一样**。
+   */
   const listSessions = async (): Promise<Array<{ sessionId?: string; blank?: boolean; updatedAt?: number }>> => {
     try {
       const data = await apiRpc('session/list', {
         type: 'client-request', rpcId: 'dsh-sentinel-list-' + Date.now(),
         method: 'session/list', payload: { args: { _request: {} } },
       })
-      return data?.result?.value?.items ?? []
-    } catch { return [] }
+      const { items, error } = classifySessionList(data)
+      // ★ 2026-10-14：修前这里是 `catch { return [] }`，把 401 **吞成「空列表」**
+      //   ⇒ 调用方读作「web 还没起好」并继续等 60 秒（日志写「等待会话列表就绪」）。
+      //   现在**每次都记一行**，让「认证失败」与「真的没有会话」在日志里长得不一样。
+      if (error !== '') logEvent('会话列表读取失败（' + error + '）')
+      return items as Array<{ sessionId?: string; blank?: boolean; updatedAt?: number }>
+    } catch (err) {
+      logEvent('会话列表读取异常：' + (err instanceof Error ? err.name + ': ' + err.message : String(err)))
+      return []
+    }
   }
 
   /**
@@ -390,7 +413,14 @@ export function apply(ctx: Context, config: Config): void {
     const attempts = Math.max(1, Math.trunc(config.promptAttempts))
     const gap = Math.max(0, Math.trunc(config.promptRetryDelayMs))
     let reason = '未执行任何尝试'
+    // ★ 2026-10-14：把「试了几次、跨多久、每轮各自的原因」带出来 —— 修前只回**最后一次**的原因，
+    //   于是「401 持续了 3 秒还是 3 分钟」**答不出来**（而修法取决于这个时长：短 ⇒ 等；
+    //   长 ⇒ 该查 auth 而不是加轮次）。§5.22 五问④「结果质量」与③「断在哪一段」都靠它。
+    const started = Date.now()
+    let tries = 0
+    let firstReason = ''
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      tries = attempt
       try {
         const data = await apiRpc('session/prompt', {
           type: 'client-request', rpcId: 'dsh-sentinel-' + Date.now(),
@@ -402,9 +432,11 @@ export function apply(ctx: Context, config: Config): void {
       } catch (err) {
         reason = 'fetch 异常: ' + (err instanceof Error ? err.name + ': ' + err.message : String(err))
       }
+      if (firstReason === '') firstReason = reason
       if (attempt < attempts) await sleep(gap)
     }
-    return { ok: false, reason }
+    const spanMs = Date.now() - started
+    return { ok: false, reason: summarizeFailedAttempts(tries, spanMs, firstReason, reason) }
   }
 
   /** 通知类目标选择（预检报告/拦截告知）：与唤醒共用同一套裁决——不再各自手搓排序。 */

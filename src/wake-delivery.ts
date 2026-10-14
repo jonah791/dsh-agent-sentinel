@@ -30,6 +30,49 @@ export interface WakeAttemptPlan {
 }
 
 /**
+ * 渲染一次「全部尝试都失败」的失败摘要 —— ★ 2026-10-14 抽成纯函数（判据随之可测）。
+ *
+ * 存在理由：修前 `sendPrompt` 只回**最后一次**的原因，于是
+ *   **「401 持续了 3 秒还是 3 分钟」答不出来** —— 而修法恰恰取决于这个时长
+ *   （短 ⇒ 等一轮就好；长 ⇒ 该查 auth，加轮次没用）。
+ *   ⇒ 现场（2026-10-14 06:02:45 那次改投）就卡在这一格：日志只说
+ *   `fetch 异常: SyntaxError: Unexpected token 'u', "unauthorized" …`，
+ *   **次数与跨度都没有**。
+ *
+ * @param tries - 实际尝试次数
+ * @param spanMs - 从第一次尝试到放弃的跨度（毫秒）
+ * @param firstReason - 第一次失败的原因
+ * @param lastReason - 最后一次失败的原因
+ * @returns 人类可读摘要（**永不缺失原因**）
+ */
+export function summarizeFailedAttempts(tries: number, spanMs: number, firstReason: string, lastReason: string): string {
+  const head = '尝试 ' + String(tries) + ' 次 / 跨 ' + String(Math.round(spanMs / 1000)) + 's：'
+  // 同因重复 ⇒ 只报一次（日志要短）；原因**变化** ⇒ 全部带出（那说明是不同故障，不是同一次抖动）
+  if (firstReason === lastReason || firstReason === '') return head + lastReason
+  return head + '首次[' + firstReason + '] → 末次[' + lastReason + ']'
+}
+
+/**
+ * 把 `session/list` 的返回值判成「会话数组」或「读失败」—— ★ 2026-10-14 抽成纯函数。
+ *
+ * 存在理由（**根因级**）：修前 `listSessions` 是 `try { … } catch { return [] }`，
+ *   把认证失败（web auth 层直回的纯文本 `unauthorized`）**吞成了「空列表」**。
+ *   后果不是「读不到」，是**把 401 读成了「web 还没起好」**：调用方见 `items=0`
+ *   就继续等 60 秒（日志写「等待会话列表就绪」），而真相是**认证已经失败**。
+ *   现场（2026-10-14 06:01:39）就是这么走的，**外部判不出**。
+ *
+ * @param data - `apiRpc` 的原始返回（成功时是 JSON-RPC 信封；401 时是纯文本）
+ * @returns `{ items, error }` —— **恰有一个非空**：`items` 为数组时 `error` 为空串
+ */
+export function classifySessionList(data: unknown): { items: unknown[]; error: string } {
+  const items = (data as { result?: { value?: { items?: unknown } } } | undefined)?.result?.value?.items
+  if (Array.isArray(items)) return { items, error: '' }
+  // 形状不符：多半是 401（web auth 层直接回纯文本，不是 JSON-RPC 信封）
+  const shown = typeof data === 'string' ? JSON.stringify(data.slice(0, 80)) : JSON.stringify(data).slice(0, 120)
+  return { items: [], error: '形状不符（可能是认证 401）：' + shown }
+}
+
+/**
  * 编排候选尝试计划：`order[0]`（首选/触发者）跑 `primaryWaves` 轮，其余跑 `othersWaves` 轮。
  * 动机：旧实现「首选失败即换靶」——而重启后首选失败的最常见原因是
  * 「该会话刚被打断、正在恢复」，等一轮往往就好了；换靶的代价是**触发者永远收不到**。

@@ -18,6 +18,8 @@ import {
   rerouteNotice,
   summarizeFailures,
   truncateText,
+  classifySessionList,
+  summarizeFailedAttempts,
 } from '../lib/wake-delivery.js'
 
 // ---------- 编排 ----------
@@ -116,4 +118,62 @@ test('事故形状复刻：首选（触发者）连败 → 第二候选败 → �
   assert.match(notice, /会话正在运行/)
   assert.match(notice, /会话不存在/)
   assert.match(notice, /session-879c4ae1-third/)
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ★ 2026-10-14：两处**根因级**修复的判据（现场：主人「怎么重启后又没有发提醒」）
+//
+// 事故链（`.watch-events.log` 2026-10-14T06:01–06:03 现读）：
+//   06:01:39 `等待会话列表就绪: items=0 用户会话=0（第 1 轮，已等 0s/180s）`  ← ★ 这**不是**「没起好」
+//   06:02:33 唤醒目标裁决 → 首选 = 触发者会话（正常）
+//   06:02:45 投递失败（第 1/2 轮）：`fetch 异常: SyntaxError: … "unauthorized" …`
+//   06:03:00 投递失败（第 2/2 轮）：同因
+//   06:03:01 **改投** session-3ac2bffa ⇒ 提醒进了别的会话，**触发者永远收不到**
+//   06:03:04 telegram 兜底也失败（Unauthorized）⇒ 两层防线同时失效
+// ═══════════════════════════════════════════════════════════════════════════
+
+test('★ classifySessionList：401 的纯文本 `unauthorized` ⇒ 必须报**读失败**，不许读成「空列表」', () => {
+  const r = classifySessionList('unauthorized')
+  assert.deepEqual(r.items, [])
+  assert.notEqual(r.error, '', '★ 修前这里 catch 吞掉 ⇒ 调用方读作「web 还没起好」并继续等 60 秒')
+  assert.match(r.error, /401|认证/, '必须点出「这多半是认证问题」，否则读的人会往「启动慢」上查')
+  assert.match(r.error, /unauthorized/, '必须带出原文（可归因）')
+})
+
+test('★ classifySessionList：形状不符的对象 ⇒ 同样报读失败（不是只认字符串一种形态）', () => {
+  const r = classifySessionList({ some: 'unexpected' })
+  assert.notEqual(r.error, '')
+  assert.deepEqual(r.items, [])
+})
+
+test('★ classifySessionList 的对照：正常信封 ⇒ 无错、带回数组（证明判据不是恒报错）', () => {
+  const r = classifySessionList({ result: { value: { items: [{ sessionId: 'session-a' }] } } })
+  assert.equal(r.error, '')
+  assert.equal(r.items.length, 1)
+})
+
+test('★ classifySessionList 的边界：`items` 不是数组（如 null/字符串）⇒ 报读失败，不许当空表', () => {
+  assert.notEqual(classifySessionList({ result: { value: { items: null } } }).error, '')
+  assert.notEqual(classifySessionList({ result: { value: { items: 'x' } } }).error, '')
+})
+
+test('★ summarizeFailedAttempts：必须带出**次数与跨度**（修法取决于这个时长）', () => {
+  const s = summarizeFailedAttempts(10, 30000, 'unauthorized', 'unauthorized')
+  assert.match(s, /10 次/)
+  assert.match(s, /30s/)
+  assert.match(s, /unauthorized/)
+  // 同因 ⇒ 只报一次（日志要短，不许把同一句原因刷两遍）
+  assert.equal(s.split('unauthorized').length - 1, 1)
+})
+
+test('★ summarizeFailedAttempts：原因**变化** ⇒ 首末都带出（那是不同故障，不是同一次抖动）', () => {
+  const s = summarizeFailedAttempts(3, 6000, 'unauthorized', '会话不存在')
+  assert.match(s, /首次\[unauthorized\]/)
+  assert.match(s, /末次\[会话不存在\]/)
+})
+
+test('★ summarizeFailedAttempts 的边界：firstReason 为空 ⇒ 只报末次（不产出空括号）', () => {
+  const s = summarizeFailedAttempts(1, 100, '', '网络超时')
+  assert.match(s, /网络超时/)
+  assert.doesNotMatch(s, /首次\[\]/)
 })
