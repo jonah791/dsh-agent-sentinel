@@ -14,7 +14,7 @@
   <a href="https://github.com/jonah791/dsh-agent-sentinel"><img src="https://img.shields.io/badge/version-0.1.1-blue" alt="version"></a>
   <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
-  <img src="https://img.shields.io/badge/tests-56%20passed-brightgreen" alt="tests">
+  <img src="https://img.shields.io/badge/tests-83%20passed-brightgreen" alt="tests">
 </p>
 
 **一句话**：**热重载的协调员**——监听到哨兵文件就按固定顺序走一遍「预检 → 取租约 → 停旧实例 → 起新实例 → 等就绪 → 唤醒会话 → 清哨兵」，任何一步不过就**停手留档**，绝不盲重启。
