@@ -114,6 +114,56 @@ export function classifyWebProbe(input: {
 }
 
 /**
+ * 一次失败尝试的**可重试性**分类 —— ★ 2026-10-15 修（根因级 · 收口 `G-dupwake`）。
+ *
+ * 事故形状（`known-gaps.md` 的 `G-dupwake`，2026-10-12 现场）：重启后的唤醒
+ * **同一文案收到 3 次**（两轮各 3 条），而 `.watch-events.log` 里只记了**一行**
+ * `唤醒消息已发送` —— 即**多次投递真的到了会话**，而投递侧认为自己失败了。
+ *
+ * 根因（`index.ts` 的 `sendPrompt`，默认 `promptAttempts=5` × `primaryWaves=2` ⇒
+ * 最坏**同一条发 10 次**）：循环**不区分「这次调用是否已经送达」**就重试，且
+ * **每次重试都生成新的 `rpcId`/`requestId`**（`Date.now()` 递增）⇒ 服务端结构上
+ * 无法识别「这是同一次请求」⇒ 不幂等。`apiRpc` 抛异常（超时 / 响应形状不符）时，
+ * **服务端可能已经处理了这次调用**，而循环会再发一次。
+ *
+ * 判据来源（论文 arXiv:2610.16776 §3/附录 D 的编排纪律，2026-10-15 主人交办）：
+ *   「**a timeout does not prove termination**」·「未知任务状态 = **等**，不是重试」。
+ * ⇒ 分类不是「成功/失败」，是「**这次调用有没有可能已经生效**」：
+ *
+ * | 类别 | 含义 | 重试 |
+ * |---|---|---|
+ * | `rejected` | 服务端**应答并拒绝**（RPC 回了 `ok:false`；或 401 纯文本）⇒ **没生效** | ✓ 安全 |
+ * | `not-delivered` | **连接层**失败（连不上）⇒ 确定**没送达** | ✓ 安全 |
+ * | `unknown` | 超时 / 响应异常（**连上了但没拿到结论**）⇒ **可能已生效** | ✗ **不重试** |
+ *
+ * ⚠ 代价面如实标注：`unknown` 不重试 ⇒ **可能漏一次唤醒**（而它本来要防的是
+ * 「重复投递」）。两侧不对称的取严方向：漏一条提醒 = 可补；把同一件事做两遍 =
+ * **可能造成外部副作用且不可撤**（`G-dupwake` 现场主人收到的就是重复）。这一取舍
+ * 与 `guardian` 侧 `shouldDeliverWake` 同一方向。
+ */
+export type AttemptFailureKind = 'rejected' | 'not-delivered' | 'unknown'
+
+export function classifyAttemptFailure(input: {
+  /** 失败发生在哪一层：`rpc-reject` = 服务端明确拒绝；`exception` = 调用抛了异常 */
+  layer: 'rpc-reject' | 'exception'
+  /** 原始细节（RPC 的拒绝文案，或异常文本） */
+  detail: string
+}): { kind: AttemptFailureKind; retryable: boolean } {
+  // 服务端应答且拒绝 ⇒ 请求**没有生效** ⇒ 重试不会造成重复
+  if (input.layer === 'rpc-reject') return { kind: 'rejected', retryable: true }
+  const d = input.detail.toLowerCase()
+  // 401 的形态是异常（web auth 层直回纯文本，`res.json()` 抛 SyntaxError），
+  // 但**服务端应答了** ⇒ 按「被拒」处理（web 刚起时 401 是瞬时的，重试有意义且安全）
+  if (d.includes('unauthorized')) return { kind: 'rejected', retryable: true }
+  // 连接层失败 ⇒ 确定没送达
+  if (/econnrefused|enotfound|eaddrnotavail|econnreset|ehostunreach|socket hang up/.test(d)) {
+    return { kind: 'not-delivered', retryable: true }
+  }
+  // 其余（超时 / 未识别的响应异常）⇒ 可能已生效 ⇒ 不重试
+  return { kind: 'unknown', retryable: false }
+}
+
+/**
  * 编排候选尝试计划：`order[0]`（首选/触发者）跑 `primaryWaves` 轮，其余跑 `othersWaves` 轮。
  * 动机：旧实现「首选失败即换靶」——而重启后首选失败的最常见原因是
  * 「该会话刚被打断、正在恢复」，等一轮往往就好了；换靶的代价是**触发者永远收不到**。

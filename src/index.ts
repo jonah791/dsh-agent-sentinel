@@ -28,6 +28,8 @@ import {
   rerouteNotice,
   summarizeFailures,
   type PromptAttempt,
+  classifyAttemptFailure,
+  type AttemptFailureKind,
 } from './wake-delivery.ts'
 import { LEASE_TTL_MS, clearLease, writeLease } from './lease.ts'
 import {
@@ -465,20 +467,39 @@ export function apply(ctx: Context, config: Config): void {
     const started = Date.now()
     let tries = 0
     let firstReason = ''
+    // ★ 2026-10-15（收口 `G-dupwake`）：**一次投递一个稳定 id**（循环外生成）。
+    //   修前每轮重试都 `Date.now()` 换新 id ⇒ 服务端结构上认不出「这是同一次请求」⇒
+    //   不幂等。现在同 id 至少让重复**可归因**（同 id 的多条 = 同一次投递的重试，
+    //   而不是「两次独立投递」）；服务端若支持幂等则天然去重。
+    const deliveryId = 'dsh-sentinel-' + Date.now()
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       tries = attempt
+      let cls: { kind: AttemptFailureKind; retryable: boolean }
       try {
         const data = await apiRpc('session/prompt', {
-          type: 'client-request', rpcId: 'dsh-sentinel-' + Date.now(),
+          type: 'client-request', rpcId: deliveryId,
           method: 'session/prompt',
-          payload: { args: { request: { requestId: 'dsh-sentinel-' + Date.now(), sessionId, mode: 'steer', content: [{ type: 'text', text }] } } },
+          payload: { args: { request: { requestId: deliveryId, sessionId, mode: 'steer', content: [{ type: 'text', text }] } } },
         })
         if (data?.result?.ok === true) return { ok: true, reason: 'ok' }
         reason = describeReject(data?.result, data)
+        cls = classifyAttemptFailure({ layer: 'rpc-reject', detail: reason })
       } catch (err) {
         reason = 'fetch 异常: ' + (err instanceof Error ? err.name + ': ' + err.message : String(err))
+        cls = classifyAttemptFailure({ layer: 'exception', detail: reason })
       }
       if (firstReason === '') firstReason = reason
+      // ★ 2026-10-15：**只有「确定没生效」才重试**。论文判据（arXiv:2610.16776）：
+      //   「a timeout does not prove termination」—— 超时/未识别响应的那次调用**可能已经在
+      //   会话里生效了**，再发一次就是把同一件事做两遍（`G-dupwake` 现场主人收到 3 条同文案）。
+      if (!cls.retryable) {
+        const spanMs = Date.now() - started
+        return {
+          ok: false,
+          reason: summarizeFailedAttempts(tries, spanMs, firstReason, reason)
+            + '（类别 ' + cls.kind + ' ⇒ 不再重试：可能已生效，重试会重复投递）',
+        }
+      }
       if (attempt < attempts) await sleep(gap)
     }
     const spanMs = Date.now() - started
