@@ -19,6 +19,7 @@ import {
   summarizeFailures,
   truncateText,
   classifySessionList,
+  classifyWebProbe,
   summarizeFailedAttempts,
 } from '../lib/wake-delivery.js'
 
@@ -176,4 +177,51 @@ test('★ summarizeFailedAttempts 的边界：firstReason 为空 ⇒ 只报末�
   const s = summarizeFailedAttempts(1, 100, '', '网络超时')
   assert.match(s, /网络超时/)
   assert.doesNotMatch(s, /首次\[\]/)
+})
+
+/* ── ★ classifyWebProbe（2026-10-15 根因修复）：401 不得读作「web 没起来」 ──────────
+ * 现场（2026-10-15 02:09:57）：web 13 秒就打印了认证 URL（**真的起来了**），
+ * 哨兵却判「未在时限内就绪」⇒ **跳过唤醒** ⇒ 提醒没发到（主人报「重启后又没发提醒」）。
+ * 根因 = `waitWebReady` 的 `catch { /* 未就绪 *\/ }` 把 401 静默吞成「未就绪」，
+ * 而 2026-10-14 的修复只改了**下游** `classifySessionList`（上游闸门没修 ⇒ 修了一半）。
+ * 本组钉住三态语义：**401 证明服务器在跑**（unauthenticated ≠ down）。
+ */
+
+test('W1 金标准：合法 JSON-RPC 信封 ⇒ ready（不得恒 down）', () => {
+  const r = classifyWebProbe({ portOpen: true, status: 200, body: { result: { value: { items: [{ sessionId: 's1' }] } } }, error: '' })
+  assert.equal(r.state, 'ready')
+})
+
+test('W2 尸体·**401 纯文本 unauthorized ⇒ unauthenticated**（本次事故形状：不得读作 down）', () => {
+  const r = classifyWebProbe({ portOpen: true, status: 401, body: 'unauthorized', error: '' })
+  assert.equal(r.state, 'unauthenticated', '401 必须与「端口不通」分开 —— 前者是服务器在应答')
+  assert.notEqual(r.state, 'down')
+  assert.match(r.detail, /认证失败/)
+})
+
+test('W3 尸体·状态码缺失但正文含 unauthorized ⇒ 同样算认证失败（不靠单一信号）', () => {
+  const r = classifyWebProbe({ portOpen: true, status: 0, body: 'Unauthorized', error: '' })
+  assert.equal(r.state, 'unauthenticated')
+})
+
+test('W4 尸体·端口不通 ⇒ down（真「没起来」必须仍是 down，不得被放宽）', () => {
+  const r = classifyWebProbe({ portOpen: false, status: 0, body: undefined, error: '' })
+  assert.equal(r.state, 'down')
+  assert.match(r.detail, /端口未监听/)
+})
+
+test('W5 尸体·连接层异常 ⇒ down，且**带原因**（不许只说「未就绪」）', () => {
+  const r = classifyWebProbe({ portOpen: true, status: 0, body: undefined, error: 'TimeoutError: signal timed out' })
+  assert.equal(r.state, 'down')
+  assert.match(r.detail, /TimeoutError/)
+})
+
+test('W6 对照组·**空会话列表也是就绪**（空 ≠ 未就绪 —— 旧判据 `items=0` 那个坑的变体）', () => {
+  const r = classifyWebProbe({ portOpen: true, status: 200, body: { result: { value: { items: [] } } }, error: '' })
+  assert.equal(r.state, 'ready', '列表为空只说明没有会话，不说明 web 没起来')
+})
+
+test('W7 对照组·形状不符的 JSON ⇒ down（证明 W1/W6 不是恒 ready）', () => {
+  const r = classifyWebProbe({ portOpen: true, status: 200, body: { hello: 'world' }, error: '' })
+  assert.equal(r.state, 'down')
 })

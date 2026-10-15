@@ -20,6 +20,8 @@ import { decideWakeTarget, probeSessionList, probeSignature, formatWaitTrace, ty
 import {
   describeReject,
   classifySessionList,
+  classifyWebProbe,
+  type WebProbeState,
   summarizeFailedAttempts,
   isRerouted,
   planWakeAttempts,
@@ -353,21 +355,65 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   // ---------- 唤醒 ----------
-  const waitWebReady = async (timeoutMs: number): Promise<boolean> => {
+  /**
+   * 单次 web 探测（薄 I/O）—— 判据在 `classifyWebProbe`（纯函数，可离线尸体测试）。
+   *
+   * ⚠ 为什么不用 `apiRpc`：它内部 `await res.json()` 在 401（纯文本 `unauthorized`）时**抛异常**，
+   *   而抛出的异常丢失了「HTTP 401」这个关键信息（只留 SyntaxError）⇒ 无法分辨
+   *   「认证失败」与「web 没起来」。这里先取 `res.text()` 再试解析，**状态码与原文都留住**。
+   */
+  const probeWebOnce = async (): Promise<{ portOpen: boolean; status: number; body: unknown; error: string }> => {
+    const portOpen = await portInUse(ctx.agentRuntime.port)
+    if (!portOpen) return { portOpen: false, status: 0, body: undefined, error: '' }
+    try {
+      const cookie = buildBrowserAuthCookie(dshHome, authority)
+      const res = await fetch(ctx.agentRuntime.baseUrl + '/api/session/list', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...(cookie !== undefined ? { cookie } : {}) },
+        body: JSON.stringify({
+          type: 'client-request', rpcId: 'dsh-sentinel-ready-' + Date.now(),
+          method: 'session/list', payload: { args: { _request: {} } },
+        }),
+        signal: AbortSignal.timeout(10000),
+      })
+      const raw = await res.text()
+      let body: unknown = raw
+      try { body = JSON.parse(raw) } catch { /* 401 时是纯文本，保持原样 */ }
+      return { portOpen: true, status: res.status, body, error: '' }
+    } catch (err) {
+      return {
+        portOpen: true, status: 0, body: undefined,
+        error: err instanceof Error ? err.name + ': ' + err.message : String(err),
+      }
+    }
+  }
+
+  /**
+   * 等 web 就绪 —— ★ 2026-10-15 修（根因级）：**失败必须带原因，且 401 不得读作「没起来」**。
+   *
+   * 修前：`try { … } catch { /* 未就绪 *\/ }` 把 401 静默吞掉 ⇒ 90 秒超时 ⇒ 判「web 未就绪」
+   *   ⇒ **跳过唤醒**（2026-10-15 02:09:57 现场：web 13 秒就打印了认证 URL，唤醒却被跳过）。
+   *
+   * 现在三态：`ready`（会话列表可读）/ `unauthenticated`（**服务器在应答**，只是认证失败）/
+   *   `down`（端口不通或连接层失败）。**前两态都算 ok** —— 唤醒流程该继续走，让下游
+   *   （`listSessions`/`sendPrompt`）把认证失败**按认证的样子**报出来，而不是伪装成「web 没起来」。
+   */
+  const waitWebReady = async (timeoutMs: number): Promise<{ ok: boolean; state: WebProbeState; detail: string }> => {
     const start = Date.now()
+    let last: { state: WebProbeState; detail: string } = { state: 'down', detail: '未探测' }
     while (Date.now() - start < timeoutMs) {
-      if (await portInUse(ctx.agentRuntime.port)) {
-        try {
-          const data = await apiRpc('session/list', {
-            type: 'client-request', rpcId: 'dsh-sentinel-ready-' + Date.now(),
-            method: 'session/list', payload: { args: { _request: {} } },
-          })
-          if (data?.result?.ok === true) return true
-        } catch { /* 未就绪 */ }
+      const c = classifyWebProbe(await probeWebOnce())
+      last = c
+      if (c.state === 'ready') return { ok: true, state: c.state, detail: c.detail }
+      if (c.state === 'unauthenticated') {
+        // ★ 401 证明服务器在跑 ⇒ 算就绪；但**响亮记一行**，让归因指向认证而不是 web
+        logEvent('web 已应答但认证失败：' + c.detail + ' —— 唤醒将尝试，失败原因多半在认证（查 browser-session secret）')
+        return { ok: true, state: c.state, detail: c.detail }
       }
       await sleep(1000)
     }
-    return false
+    logEvent('web 未在时限内就绪（末态 ' + last.state + '：' + last.detail + '）')
+    return { ok: false, state: last.state, detail: last.detail }
   }
 
   /**
@@ -466,8 +512,11 @@ export function apply(ctx: Context, config: Config): void {
    */
   const wakeLatestSession = async (text: string, opts: { explicitId?: string; waitWebReadyMs?: number } = {}): Promise<WakeResult> => {
     const explicitId = opts.explicitId
-    if (!(await waitWebReady(opts.waitWebReadyMs ?? config.readyTimeoutMs))) {
-      return { ok: false, reason: 'web 未在时限内就绪', candidates: [] }
+    const ready = await waitWebReady(opts.waitWebReadyMs ?? config.readyTimeoutMs)
+    if (!ready.ok) {
+      // ★ 2026-10-15：reason 带上**末态与原因** —— 旧版只说「web 未在时限内就绪」，
+      //   于是「认证失败」与「端口不通」在告警里**长得一样**（§5.22 五问③答不了断在哪一段）。
+      return { ok: false, reason: 'web 未在时限内就绪（' + ready.state + '：' + ready.detail + '）', candidates: [] }
     }
     const MAX_WAIT_MS = Math.max(1000, Math.trunc(config.listWaitMs))
     const pollMs = Math.max(200, Math.trunc(config.listPollMs))

@@ -73,6 +73,47 @@ export function classifySessionList(data: unknown): { items: unknown[]; error: s
 }
 
 /**
+ * 把**一次 web 探测**判成三态 —— ★ 2026-10-15 修（根因级）。
+ *
+ * 存在理由：修前 `waitWebReady` 的判据是 `data?.result?.ok === true`，而 401 时
+ *   web auth 层直回**纯文本** `unauthorized` ⇒ `apiRpc` 里 `res.json()` 抛 SyntaxError
+ *   ⇒ 被 `catch { /* 未就绪 *\/ }` **静默吞掉** ⇒ 90 秒超时后判「web 未在时限内就绪」
+ *   并**跳过唤醒**。现场（2026-10-15 02:09:57）：web 13 秒就打印了认证 URL（真的起来了），
+ *   唤醒却被跳过，而 `.watch-incident.json` 只说「未就绪」——**认证失败被读成了「没起来」**。
+ *
+ * ★ 判据核心：**401 证明服务器在跑**（它在应答、在鉴权）。把它读作「没起来」的代价是
+ *   「该做的唤醒没做」，而且归因指向错误的方向（去查 web 而不是查认证）。
+ *   ⇒ `unauthenticated` **算就绪**，但必须**响亮**（由调用方落日志）。
+ *
+ * ⚠ 与 2026-10-14 的关系：那次修的是**下游** `classifySessionList`（把 401 从「空列表」里分出来），
+ *   **上游闸门 `waitWebReady` 没修** —— 同一个 401，下游会分辨了、上游还在吞（修了一半）。
+ *   ⇒ 本函数让上游与下游**共用同一套「401 是认证问题不是可用性问题」的语义**。
+ *
+ * @param input.portOpen - 端口是否在监听
+ * @param input.status   - HTTP 状态码；0 = 没拿到响应（连接层失败）
+ * @param input.body     - 响应体（JSON 已解析；401 时是纯文本串）
+ * @param input.error    - 连接层异常文本（空串 = 无异常）
+ */
+export type WebProbeState = 'ready' | 'unauthenticated' | 'down'
+
+export function classifyWebProbe(input: {
+  portOpen: boolean
+  status: number
+  body: unknown
+  error: string
+}): { state: WebProbeState; detail: string } {
+  if (!input.portOpen) return { state: 'down', detail: '端口未监听' }
+  if (input.error !== '') return { state: 'down', detail: '连接层失败：' + input.error }
+  const text = typeof input.body === 'string' ? input.body : ''
+  if (input.status === 401 || text.toLowerCase().includes('unauthorized')) {
+    return { state: 'unauthenticated', detail: 'HTTP ' + input.status + ' 认证失败（web 已在应答）' }
+  }
+  const { items, error } = classifySessionList(input.body)
+  if (error === '') return { state: 'ready', detail: 'HTTP ' + input.status + ' 会话列表可读（' + items.length + ' 条）' }
+  return { state: 'down', detail: 'HTTP ' + input.status + ' 响应形状不符（可能尚未就绪）：' + error }
+}
+
+/**
  * 编排候选尝试计划：`order[0]`（首选/触发者）跑 `primaryWaves` 轮，其余跑 `othersWaves` 轮。
  * 动机：旧实现「首选失败即换靶」——而重启后首选失败的最常见原因是
  * 「该会话刚被打断、正在恢复」，等一轮往往就好了；换靶的代价是**触发者永远收不到**。
